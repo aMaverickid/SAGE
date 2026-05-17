@@ -43,4 +43,9 @@ Thumbs.db
 
 # Results and cache (if they contain sensitive data)
 results/
+analysis*/
+output/
 cache/
+
+# Local backups
+*.backup

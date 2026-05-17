@@ -97,7 +97,7 @@ class SAGEStateMachine:
         self.valid_transitions = {
             SAGEState.INIT: [SAGEState.GET_EXEMPLARS],
             SAGEState.GET_EXEMPLARS: [SAGEState.ANALYZE_EXEMPLARS],
-            SAGEState.ANALYZE_EXEMPLARS: [SAGEState.PARALLEL_HYPOTHESIS_TESTING],  # Changed to parallel testing
+            SAGEState.ANALYZE_EXEMPLARS: [SAGEState.PARALLEL_HYPOTHESIS_TESTING, SAGEState.FINAL_CONCLUSION],  # Some ablations skip active testing
             SAGEState.FORM_HYPOTHESIS: [SAGEState.PARALLEL_HYPOTHESIS_TESTING],  # Keep for backward compatibility
             SAGEState.PARALLEL_HYPOTHESIS_TESTING: [SAGEState.DESIGN_TEST, SAGEState.REVIEW_ALL_HYPOTHESES],
             SAGEState.DESIGN_TEST: [SAGEState.RUN_TEST, SAGEState.ANALYZE_RESULT],

@@ -10,7 +10,10 @@ import argparse
 import os
 import json
 import time
-from typing import Dict, Any, Optional
+import random
+import re
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
 
 try:
     import torch  # optional
@@ -42,6 +45,12 @@ from core.agent import ask_agent
 from environment.experiment import ExperimentEnvironment
 from utils.common import save_final_results, str2dict
 from core.controller import SAGEController
+from experiment_variants import (
+    SUPPORTED_VARIANTS,
+    features_dict_from_specs,
+    get_variant_config,
+    parse_feature_specs_from_manifest,
+)
 
 # Import token tracker
 try:
@@ -55,19 +64,19 @@ except ImportError:
         pass
 
 
-def get_neuronpedia_config(target_llm: str, sae_path: str, sae_layer: int, 
+def get_neuronpedia_config(target_llm: str, sae_path: str, sae_layer: int,
                            neuronpedia_model_id: Optional[str] = None,
                            neuronpedia_source: Optional[str] = None) -> Dict[str, str]:
     """
     Infer Neuronpedia API model_id and source parameters from model name and SAE path.
-    
+
     Args:
         target_llm: Target model name (e.g., "google/gemma-2-2b")
         sae_path: SAE path (e.g., "sae-lens://release=gemma-scope-2b-pt-res-canonical;sae_id=layer_0/width_16k/canonical")
         sae_layer: SAE layer index (e.g., 0)
         neuronpedia_model_id: If provided, use directly; otherwise infer from target_llm
         neuronpedia_source: If provided, use directly; otherwise infer from sae_path and layer
-    
+
     Returns:
         dict with 'model_id' and 'source' keys
     """
@@ -92,14 +101,14 @@ def get_neuronpedia_config(target_llm: str, sae_path: str, sae_layer: int,
         else:
             # Default to gpt2-small
             model_id = 'gpt2-small'
-    
+
     # Determine source: use provided value if available, otherwise infer
     if neuronpedia_source:
         source = neuronpedia_source
     else:
         # Infer source from sae_path and layer (fallback)
         sae_path_lower = sae_path.lower()
-        
+
         # Check for gemmascope-related identifiers
         if 'gemmascope' in sae_path_lower:
             if '16k' in sae_path_lower or '16K' in sae_path_lower:
@@ -124,7 +133,7 @@ def get_neuronpedia_config(target_llm: str, sae_path: str, sae_layer: int,
                 source = f"{sae_layer}-resid-post-aa"
             else:
                 source = f"{sae_layer}-res-jb"  # default
-    
+
     return {
         'model_id': model_id,
         'source': source
@@ -148,6 +157,10 @@ def call_argparse():
     parser.add_argument('--debug', action='store_true', help='Enable debug prints')
     parser.add_argument('--max_rounds', type=int, default=14, help='Maximum number of rounds')
     parser.add_argument('--timeout_minutes', type=int, default=30, help='Timeout in minutes')
+    parser.add_argument('--experiment_variant', type=str, default='full', choices=sorted(SUPPORTED_VARIANTS), help='Agent4Interp diagnostic variant to run')
+    parser.add_argument('--random_seed', type=int, default=0, help='Random seed for reproducible diagnostic variants')
+    parser.add_argument('--manifest_path', type=str, default=None, help='Optional Agent4Interp feature manifest JSON. Overrides --features when provided.')
+    parser.add_argument('--save_trace', type=lambda x: x.lower() == 'true', default=True, help='Save compact experiment_trace.json for audit/debugging')
 
     # Dataset sampling parameters (match Neuronpedia: n_prompts_total=24576, n_prompts_in_forward_pass=128)
     parser.add_argument('--max_samples', type=int, default=5000, help='Maximum corpus samples to evaluate (default: 5000, Neuronpedia: 24576)')
@@ -167,24 +180,97 @@ def call_argparse():
     return args
 
 
-def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int) -> Dict[str, Any]:
+def load_manifest_feature_specs(manifest_path: Optional[str]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not manifest_path:
+        return None, []
+    path = Path(manifest_path)
+    with path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    specs = parse_feature_specs_from_manifest(manifest)
+    return manifest, specs
+
+
+def find_feature_spec(feature_specs: List[Dict[str, Any]], sae_layer_index: int, feature_index: int) -> Dict[str, Any]:
+    for spec in feature_specs:
+        if int(spec.get("layer_index", -1)) == sae_layer_index and int(spec.get("feature_index", -1)) == feature_index:
+            return dict(spec)
+    return {
+        "layer": f"layer{sae_layer_index}",
+        "layer_index": sae_layer_index,
+        "feature_index": feature_index,
+        "selection_method": "cli_features",
+    }
+
+
+def extract_final_sections(analysis_history: List[str]) -> Dict[str, str]:
+    conclusion = ""
+    for item in reversed(analysis_history):
+        if "[DESCRIPTION]:" in item and "[EVIDENCE]:" in item:
+            conclusion = item
+            break
+    if not conclusion:
+        return {"description": "", "evidence": "", "labels": ""}
+
+    desc_match = re.search(r"\[DESCRIPTION\]:\s*(.+?)(?=\[EVIDENCE\]:|\[LABEL|$)", conclusion, re.DOTALL)
+    evidence_match = re.search(r"\[EVIDENCE\]:\s*(.+?)(?=\[LABEL|$)", conclusion, re.DOTALL)
+    labels = re.findall(r"\[LABEL\s*\d*\]:\s*(.+?)(?=\[LABEL\s*\d*\]:|$)", conclusion, re.DOTALL)
+    return {
+        "description": desc_match.group(1).strip() if desc_match else "",
+        "evidence": evidence_match.group(1).strip() if evidence_match else "",
+        "labels": "\n".join(label.strip() for label in labels if label.strip()),
+    }
+
+
+def save_final_text_artifacts(results: Dict[str, Any], path2save: str) -> None:
+    sections = extract_final_sections(results.get("analysis_history", []))
+    if not sections["description"]:
+        return
+    artifacts = {
+        "description.txt": sections["description"],
+        "evidence.txt": sections["evidence"],
+        "labels.txt": sections["labels"],
+    }
+    for filename, content in artifacts.items():
+        with open(os.path.join(path2save, filename), "w", encoding="utf-8") as f:
+            f.write(content.strip() + ("\n" if content.strip() else ""))
+
+
+def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int, feature_spec: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Run experiment for a single feature."""
     print(f"\n{'='*20} Starting Experiment: Layer {sae_layer_index}, Feature {feature_index} {'='*20}")
-    
+
+    variant_config = get_variant_config(args.experiment_variant)
+    feature_spec = feature_spec or {
+        "layer": f"layer{sae_layer_index}",
+        "layer_index": sae_layer_index,
+        "feature_index": feature_index,
+        "selection_method": "cli_features",
+    }
+    effective_target_llm = str(feature_spec.get("model_name") or args.target_llm)
+    effective_neuronpedia_model_id = str(feature_spec.get("neuronpedia_model_id") or args.neuronpedia_model_id or "")
+    effective_neuronpedia_source = str(feature_spec.get("source") or args.neuronpedia_source or "")
+
     # Determine save path
-    path2save = os.path.join(args.path2save, args.agent_llm, args.target_llm.replace('/', '_'), f"layer_{sae_layer_index}", f"feature_{feature_index}")
-    
+    path2save = os.path.join(
+        args.path2save,
+        variant_config.name,
+        args.agent_llm,
+        effective_target_llm.replace('/', '_'),
+        f"layer_{sae_layer_index}",
+        f"feature_{feature_index}",
+    )
+
     # Check if results already exist
     if os.path.exists(os.path.join(path2save, 'description.txt')):
         print("Results already exist. Skipping.")
         return {"status": "skipped", "reason": "results_exist"}
-    
+
     os.makedirs(path2save, exist_ok=True)
-    
+
     # Reset token tracker (create new statistics for each experiment)
     if TOKEN_TRACKING_AVAILABLE:
         reset_tracker()
-    
+
     try:
         # Get Neuronpedia API configuration (if using API)
         neuronpedia_config = None
@@ -196,34 +282,34 @@ def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int
             print("   - All activation data will be fetched from Neuronpedia API")
             print("   - use_saedashboard will be automatically disabled")
             print("=" * 80)
-            
+
             # Validate that source is provided or can be inferred
-            if not args.neuronpedia_source:
+            if not effective_neuronpedia_source:
                 print(f"⚠️  Warning: --neuronpedia_source not provided. Will attempt to infer from sae_path and layer.")
                 print(f"   For better accuracy, please provide --neuronpedia_source explicitly.")
-            
+
             neuronpedia_config = get_neuronpedia_config(
-                target_llm=args.target_llm,
+                target_llm=effective_target_llm,
                 sae_path=args.sae_path,
                 sae_layer=sae_layer_index,
-                neuronpedia_model_id=args.neuronpedia_model_id,
-                neuronpedia_source=args.neuronpedia_source
+                neuronpedia_model_id=effective_neuronpedia_model_id or None,
+                neuronpedia_source=effective_neuronpedia_source or None
             )
             print(f"📡 Neuronpedia API Config: model_id={neuronpedia_config['model_id']}, source={neuronpedia_config['source']}")
-            if args.neuronpedia_source:
-                print(f"   ✅ Source provided explicitly: {args.neuronpedia_source}")
+            if effective_neuronpedia_source:
+                print(f"   ✅ Source provided explicitly: {effective_neuronpedia_source}")
             else:
                 print(f"   ⚠️  Source inferred from sae_path and layer: {neuronpedia_config['source']}")
                 print(f"   💡 Tip: To ensure accuracy, provide --neuronpedia_source explicitly")
-            
+
             # Automatically disable use_saedashboard when using API
             if args.use_saedashboard:
                 print(f"   ⚠️  use_saedashboard is enabled but will be ignored (API mode takes precedence)")
             args.use_saedashboard = False
-        
+
         # Initialize system components
         system = System(
-            llm_name=args.target_llm,
+            llm_name=effective_target_llm,
             sae_path=args.sae_path,
             sae_layer=sae_layer_index,
             feature_index=feature_index,
@@ -233,7 +319,7 @@ def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int
             neuronpedia_model_id=neuronpedia_config['model_id'] if neuronpedia_config else None,
             neuronpedia_source=neuronpedia_config['source'] if neuronpedia_config else None
         )
-        
+
         tools = Tools(
             system=system,
             agent_llm_name=args.agent_llm,
@@ -257,7 +343,7 @@ def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int
 
         # Initialize log (simplified initialization, all prompts dynamically generated by prompt_generator)
         tools.init_log()
-        
+
         # Create SAGE controller
         controller = SAGEController(
             feature_id=feature_index,
@@ -266,60 +352,77 @@ def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int
             tools=tools,
             experiment_env=experiment_env,
             debug=args.debug,
-            top_k=args.top_k
+            max_rounds=args.max_rounds,
+            top_k=args.top_k,
+            experiment_variant=variant_config.name,
+            variant_config=variant_config,
+            random_seed=args.random_seed,
+            feature_spec=feature_spec,
         )
-        
+
         # Run experiment
         start_time = time.time()
         results = controller.run()
         end_time = time.time()
-        
+
         # Add execution time
         results["execution_time_seconds"] = end_time - start_time
-        
+        results["experiment_variant"] = variant_config.name
+        results["variant_config"] = variant_config.to_dict()
+        results["feature_spec"] = feature_spec
+        results["random_seed"] = args.random_seed
+        results["target_llm"] = effective_target_llm
+        if neuronpedia_config:
+            results["neuronpedia_config"] = neuronpedia_config
+
         # Save results
         save_final_results(tools.get_log(), path2save)
-        
+
         # Save token statistics (if available)
         if TOKEN_TRACKING_AVAILABLE:
             tracker = get_tracker()
             if tracker:
                 token_summary = tracker.get_summary()
                 results["token_usage"] = token_summary
-                
+
                 # Save detailed token statistics to separate file
                 token_stats_path = os.path.join(path2save, 'token_usage.json')
                 tracker.save_to_file(token_stats_path)
-                
+
                 # Print token statistics summary
                 tracker.print_summary()
-        
+
         # Save structured results
-        with open(os.path.join(path2save, 'structured_results.json'), 'w') as f:
-            json.dump(results, f, indent=2)
-        
+        with open(os.path.join(path2save, 'structured_results.json'), 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+        if args.save_trace:
+            with open(os.path.join(path2save, 'experiment_trace.json'), 'w', encoding='utf-8') as f:
+                json.dump(results.get("experiment_trace", {}), f, indent=2, ensure_ascii=False)
+        save_final_text_artifacts(results, path2save)
+
         # Check if there is a valid conclusion
         has_conclusion = any(
             "[DESCRIPTION]:" in analysis and "[EVIDENCE]:" in analysis and "[LABEL" in analysis
             for analysis in results.get("analysis_history", [])
         )
-        
+
         if has_conclusion:
             print(f"✅ Experiment for Feature {feature_index} completed successfully with conclusion. Results saved to {path2save}")
             return {"status": "completed", "results": results}
         else:
             print(f"⚠️  Experiment for Feature {feature_index} completed but no valid conclusion generated. Results saved to {path2save}")
             return {"status": "incomplete", "results": results}
-        
+
     except Exception as e:
         print(f"❌ Fatal error during experiment for feature {feature_index}: {e}")
-        
+
         # Save error log
         try:
             save_final_results(tools.get_log(), path2save, filename="error_log.json")
         except:
             pass
-        
+
         return {"status": "error", "error": str(e)}
 
 
@@ -330,25 +433,42 @@ def main(args):
     print(f"🐍 Virtual environment: {os.environ.get('VIRTUAL_ENV', 'Not activated')}")
     print(f"📄 Main file: {os.path.abspath(__file__)}")
     print(f"⚙️  Environment config: {os.path.join(os.getcwd(), 'sage_config.env')}")
+    print(f"🧪 Experiment variant: {args.experiment_variant}")
+    print(f"🎲 Random seed: {args.random_seed}")
     print("-" * 50)
-    
+
+    random.seed(args.random_seed)
+    if torch is not None:
+        try:
+            torch.manual_seed(args.random_seed)
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.manual_seed_all(args.random_seed)
+        except Exception:
+            pass
+
     # Get list of features to analyze
-    features_to_run = args.features
+    manifest, feature_specs = load_manifest_feature_specs(args.manifest_path)
+    if manifest is not None:
+        features_to_run = features_dict_from_specs(feature_specs)
+        print(f"📋 Loaded manifest: {args.manifest_path} ({len(feature_specs)} feature specs)")
+    else:
+        features_to_run = args.features
     total_experiments = sum(len(features) for features in features_to_run.values())
     completed_experiments = 0
-    
+
     print(f"📊 Total experiments to run: {total_experiments}")
-    
+
     # Outer loop: iterate through all specified layers
     for layer_str, feature_indices in features_to_run.items():
         sae_layer_index = int(layer_str.replace('layer', ''))
-        
+
         # Inner loop: iterate through all specified features in this layer
         for feature_index in feature_indices:
             try:
-                result = run_single_feature_experiment(args, sae_layer_index, feature_index)
+                feature_spec = find_feature_spec(feature_specs, sae_layer_index, feature_index)
+                result = run_single_feature_experiment(args, sae_layer_index, feature_index, feature_spec=feature_spec)
                 completed_experiments += 1
-                
+
                 if result["status"] == "completed":
                     print(f"✅ Experiment {completed_experiments}/{total_experiments} completed successfully with conclusion")
                 elif result["status"] == "incomplete":
@@ -357,14 +477,14 @@ def main(args):
                     print(f"⏭️  Experiment {completed_experiments}/{total_experiments} skipped (already exists)")
                 else:
                     print(f"❌ Experiment {completed_experiments}/{total_experiments} failed: {result.get('error', 'Unknown error')}")
-                
+
             except KeyboardInterrupt:
                 print("\n🛑 Experiment interrupted by user")
                 break
             except Exception as e:
                 print(f"❌ Unexpected error in experiment {completed_experiments + 1}/{total_experiments}: {e}")
                 completed_experiments += 1
-    
+
     print(f"\n🎉 All experiments completed! {completed_experiments}/{total_experiments} experiments processed.")
 
 

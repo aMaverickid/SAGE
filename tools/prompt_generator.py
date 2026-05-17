@@ -5,14 +5,17 @@ SAGE Prompt Generator - Layer 2: 动态Prompt生成器
 
 from typing import List, Dict, Any
 from core.state_machine import SAGEStateMachine, SAGEState, Hypothesis, TestResult, Exemplar
+from experiment_variants import VariantConfig, get_variant_config
 
 
 class PromptGenerator:
     """动态Prompt生成器 - 根据状态生成定制Prompt"""
     
-    def __init__(self, state_machine: SAGEStateMachine, top_k: int = 10):
+    def __init__(self, state_machine: SAGEStateMachine, top_k: int = 10,
+                 variant_config: VariantConfig = None):
         self.sm = state_machine
         self.top_k = top_k
+        self.variant_config = variant_config or get_variant_config("full")
         # Cache for tested tokens (optimization)
         self._tested_tokens_cache = None
         self._cache_invalidation_count = 0
@@ -23,8 +26,9 @@ class PromptGenerator:
         # 基础上下文 (所有状态共享)
         base_context = f"""
 You are SAGE analyzing SAE Feature {self.sm.feature_id} at Layer {self.sm.layer}.
-Current Round: {self.sm.round}/14
+Current Round: {self.sm.round}/{self.sm.max_rounds}
 Current State: {self.sm.state.value}
+Experiment Variant: {self.variant_config.name} ({self.variant_config.description})
 """
         
         # According to状态生成特定指令
@@ -97,8 +101,42 @@ Current State: {self.sm.state.value}
         # 注入exemplar数据
         exemplars_summary = self._summarize_exemplars_for_hypothesis()
         
+        hypothesis_count = self.variant_config.max_initial_hypotheses
+        if hypothesis_count == 1:
+            hypothesis_format = "Hypothesis_1: [Best single, specific, testable claim based on analysis]"
+            hypothesis_guidance = "- Produce exactly ONE best hypothesis because this is the single_hypothesis/single_pass diagnostic setting"
+        else:
+            hypothesis_format = """Hypothesis_1: [Specific, testable claim based on analysis]
+Hypothesis_2: [Alternative explanation for the patterns]
+Hypothesis_3: [Edge case consideration - what might NOT activate this feature]
+Hypothesis_4: [Additional hypothesis covering different aspects]"""
+            hypothesis_guidance = "- Form multiple distinct hypotheses to capture possible polysemantic behavior"
+
+        negative_control_line = (
+            "- Include at least one negative control hypothesis"
+            if self.variant_config.require_negative_controls
+            else "- Negative controls are optional in this ablation; do not force one if the exemplars do not support it"
+        )
+
+        passive_note = ""
+        if not self.variant_config.active_testing:
+            passive_note = """
+**Variant Note**:
+- This diagnostic variant will NOT run synthetic model.run tests after this step.
+- Make the observation and hypothesis text self-contained enough for a final passive conclusion.
+"""
+
+        output_aware_note = ""
+        if self.variant_config.output_aware:
+            output_aware_note = """
+**Output-Aware Note**:
+- In addition to input triggers, flag any plausible output-side role the feature might have.
+- Mark such claims as tentative unless later output/logit/steering evidence is available.
+"""
+
         return f"""
-**ROUND 2/14 - ANALYZE EXEMPLARS & FORM HYPOTHESES**
+**ROUND 2/{self.sm.max_rounds} - ANALYZE EXEMPLARS & FORM HYPOTHESES**
+{passive_note}{output_aware_note}
 
 **Task**: We have executed the maximum activation test on the corpus. Your mission is to systematically analyze and interpret specific SAE features. After analyzing the exemplar data, you MUST explicitly state hypotheses.
 
@@ -113,10 +151,7 @@ OBSERVATION:
 - Common elements: [list of common features from real exemplars]
 
 [HYPOTHESIS LIST]:
-Hypothesis_1: [Specific, testable claim based on analysis]
-Hypothesis_2: [Alternative explanation for the patterns]
-Hypothesis_3: [Edge case consideration - what might NOT activate this feature]
-Hypothesis_4: [Additional hypothesis covering different aspects]
+{hypothesis_format}
 ```
 
 **Analysis & Hypothesis Formation Guidelines**:
@@ -130,7 +165,8 @@ Hypothesis_4: [Additional hypothesis covering different aspects]
 - **MANDATORY**: After observations, form specific, testable hypotheses about what the feature detects
 - Be precise: "This feature detects Python import statements" not "This feature detects programming"
 - Each hypothesis must be testable with model.run
-- Include at least one negative control hypothesis
+{hypothesis_guidance}
+{negative_control_line}
 
 **Format Requirements**:
 - Always start each hypothesis with "Hypothesis_X: [your specific hypothesis]"
@@ -176,7 +212,7 @@ Proceeding directly to design tests.
         hyp_id = self.sm.current_hypothesis_id if self.sm.current_hypothesis_id else 'X'
         
         return f"""
-**ROUND {self.sm.round + 1}/14 - DESIGN TEST - H{hyp_id}**
+**ROUND {self.sm.round + 1}/{self.sm.max_rounds} - DESIGN TEST - H{hyp_id}**
 {current_hyp_info}
 **YOUR TASK**: Design ONE test for the hypothesis. Write EXACTLY 3 lines, then STOP.
 
@@ -213,10 +249,7 @@ EXPECTED: High activation on token 'it' (>10)
 - THEN you can write ANALYSIS based on REAL data
 
 **Test Design Strategy**:
-- Design test that clearly supports or refutes hypothesis
-- For positive tests: Use text that should STRONGLY activate (clear positive case)
-- For negative controls: Use text that should NOT activate (clear negative case)
-- Prioritize untested high-activation corpus tokens if listed above
+{self._variant_test_strategy()}
 - Keep test_prompt under 200 characters
 - Do NOT repeat previous tests
 """
@@ -253,7 +286,7 @@ EXPECTED: High activation on token 'it' (>10)
         hyp_id = self.sm.current_hypothesis_id if self.sm.current_hypothesis_id else 'X'
         
         return f"""
-**ROUND {self.sm.round + 1}/14 - ANALYZE RESULT - H{hyp_id}**
+**ROUND {self.sm.round + 1}/{self.sm.max_rounds} - ANALYZE RESULT - H{hyp_id}**
 {current_hyp_info}
 **YOUR TASK**: Analyze the test results below and update hypothesis status.
 
@@ -341,8 +374,14 @@ Evidence: Test shows '▁for'=13.8 in "That's it for now", consistent with corpu
         if self.sm.round >= 12:
             urgency_note = "\n⚠️ **Late round** - prioritize CONFIRMED/REFUTED to reach conclusion.\n"
         
+        refinement_rule = (
+            "- REFINE is disabled for this diagnostic variant. If evidence is partial, keep original hypothesis text and choose CONFIRMED, REFUTED, or UNCHANGED."
+            if not self.variant_config.allow_refinement
+            else "- REFINE when the hypothesis captures only part of the observed behavior or needs sharper boundaries."
+        )
+
         return f"""
-**ROUND {self.sm.round + 1}/14 - UPDATE HYPOTHESIS**
+**ROUND {self.sm.round + 1}/{self.sm.max_rounds} - UPDATE HYPOTHESIS**
 {urgency_note}{current_hyp_info}
 **YOUR TASK**: Update Hypothesis {self.sm.current_hypothesis_id if self.sm.current_hypothesis_id else 'X'} based on test analysis.
 
@@ -364,6 +403,7 @@ STATUS ASSESSMENT:
 Current Status: [CONFIRMED / REFUTED / REFINED / UNCHANGED]
 Reason: [MANDATORY - Detailed explanation citing test results, activation values, and patterns]
 ```
+{self._variant_update_format_note()}
 
 **Corpus Coverage Check** (MANDATORY Before Concluding):
 1. Identify ALL tokens with activation ≥10.0 from corpus exemplars (Round 2)
@@ -379,6 +419,7 @@ Reason: [MANDATORY - Detailed explanation citing test results, activation values
 
 **Rules**:
 - Do NOT issue [TOOL] commands
+{refinement_rule}
 - **MANDATORY**: After 2+ test results, UNCHANGED is FORBIDDEN
 - **MANDATORY**: Check corpus coverage before concluding
 - Be honest about evidence sufficiency
@@ -386,6 +427,20 @@ Reason: [MANDATORY - Detailed explanation citing test results, activation values
     
     def _get_full_decision_criteria(self) -> str:
         """Full decision criteria for early rounds (0-2 tests)."""
+        refined_block = """
+**REFINED** (when):
+- Test results do NOT provide strong evidence (weak/moderate activation)
+- Results do NOT match expectations (hypothesis expects high but got moderate/low, or vice versa)
+- Evidence insufficient to CONFIRM or REFUTE (ambiguous patterns)
+- Context-dependent pattern needs qualification
+"""
+        if not self.variant_config.allow_refinement:
+            refined_block = """
+**REFINED**: DISABLED in this diagnostic variant.
+- If evidence is ambiguous, choose UNCHANGED for 0-1 tests or REFUTED/CONFIRMED for 2+ tests.
+- Do not write "Refined version:".
+"""
+
         return """
 **Decision Criteria**:
 
@@ -398,38 +453,64 @@ Reason: [MANDATORY - Detailed explanation citing test results, activation values
 - ≥2 tests consistently contradict hypothesis
 - 1 positive test fails AND 1 negative control activates
 - Activation values opposite to hypothesis prediction
-
-**REFINED** (when):
-- Test results do NOT provide strong evidence (weak/moderate activation)
-- Results do NOT match expectations (hypothesis expects high but got moderate/low, or vice versa)
-- Evidence insufficient to CONFIRM or REFUTE (ambiguous patterns)
-- Context-dependent pattern needs qualification
+""" + refined_block + """
 
 **UNCHANGED** (only with 0-1 tests):
 - Insufficient data to make decision
 
 **🚨 CRITICAL: 2+ Tests = UNCHANGED is FORBIDDEN 🚨**
-- With 2+ test results, MUST choose CONFIRMED, REFUTED, or REFINED
+- With 2+ test results, MUST choose a terminal status allowed by this variant
+"""
+
+    def _variant_update_format_note(self) -> str:
+        if self.variant_config.allow_refinement:
+            return ""
+        return """
+**Variant Format Restriction**:
+- Do not choose REFINED in this variant.
+- Valid statuses are CONFIRMED, REFUTED, or UNCHANGED.
 """
     
     def _get_abbreviated_decision_criteria(self, num_tests: int) -> str:
         """Abbreviated criteria for mid rounds (3-5 tests)."""
+        refined_line = "REFINED: Weak/ambiguous evidence (doesn't match expectations)"
+        if not self.variant_config.allow_refinement:
+            refined_line = "REFINED: DISABLED in this diagnostic variant"
         return f"""
 **Decision Criteria** ({num_tests} tests completed):
 
 **CONFIRMED**: Strong evidence supporting (≥2 tests with expected results)
 **REFUTED**: Strong evidence contradicting (≥2 tests with opposite results)
-**REFINED**: Weak/ambiguous evidence (doesn't match expectations)
-**UNCHANGED**: FORBIDDEN with {num_tests} tests - choose CONFIRMED, REFUTED, or REFINED
+{refined_line}
+**UNCHANGED**: FORBIDDEN with {num_tests} tests - choose a terminal status
 """
     
     def _get_minimal_decision_criteria(self, num_tests: int) -> str:
         """Minimal criteria for late rounds (6+ tests)."""
+        options = "CONFIRMED (strong support), REFUTED (strong contradiction), or REFINED (weak/ambiguous)"
+        if not self.variant_config.allow_refinement:
+            options = "CONFIRMED (strong support) or REFUTED (strong contradiction); REFINED is disabled"
         return f"""
 **Decision** ({num_tests} tests completed):
-Choose CONFIRMED (strong support), REFUTED (strong contradiction), or REFINED (weak/ambiguous).
+Choose {options}.
 UNCHANGED is FORBIDDEN with {num_tests} tests.
 """
+
+    def _variant_test_strategy(self) -> str:
+        if not self.variant_config.targeted_tests:
+            return """- This is a random_test ablation: use a non-targeted corpus-like probe or neutral control, not a custom sentence engineered for the hypothesis
+- Do not optimize for high activation; the goal is to measure the value of targeted active testing"""
+
+        lines = [
+            "- Design test that clearly supports or refutes hypothesis",
+            "- For positive tests: Use text that should STRONGLY activate (clear positive case)",
+        ]
+        if self.variant_config.require_negative_controls:
+            lines.append("- For negative controls: Use text that should NOT activate (clear negative case)")
+        else:
+            lines.append("- Negative controls are optional in this ablation")
+        lines.append("- Prioritize untested high-activation corpus tokens if listed above")
+        return "\n".join(lines)
     
     def _prompt_review_all_hypotheses(self) -> str:
         """审查所有假设的Prompt"""
@@ -540,6 +621,15 @@ When suggesting additional tests, format them EXACTLY like this so they can be a
 - Use all available evidence from tests, hypotheses, and exemplars
 """
         
+        output_aware_requirement = ""
+        if self.variant_config.output_aware:
+            output_aware_requirement = """
+**Output-Aware Audit**:
+- Add a short paragraph under [EVIDENCE] beginning with "Output-aware audit:".
+- State whether output/logit/steering evidence was available.
+- Separate input-activation claims from causal/output-role claims.
+"""
+
         return f"""
 **ROUND {self.sm.round + 1}/{self.sm.max_rounds} - FINAL CONCLUSION**
 {max_round_note}
@@ -548,6 +638,7 @@ When suggesting additional tests, format them EXACTLY like this so they can be a
 
 **All Evidence**:
 {evidence_summary}
+{output_aware_requirement}
 
 **Hypothesis Status**:
 {self._format_all_hypotheses()}
@@ -816,10 +907,21 @@ Must be specific and complete. Include activation ranges and statistical evidenc
     
     def _compile_evidence(self) -> str:
         """编译所有证据"""
+        evidence = ""
+        if self.sm.exemplars:
+            evidence += "Corpus Exemplar Evidence:\n"
+            for i, ex in enumerate(self.sm.exemplars[: min(5, len(self.sm.exemplars))], 1):
+                snippet = getattr(ex, "text", "")[:60].replace("\n", " ")
+                evidence += f"{i}. '{snippet}...' → max activation {getattr(ex, 'activation', 0.0):.3f}\n"
+            evidence += "\n"
+
         if not self.sm.test_history:
+            if evidence:
+                evidence += "Synthetic Test Evidence: No synthetic tests run in this variant.\n"
+                return evidence
             return "No test evidence available"
         
-        evidence = "Test Evidence:\n"
+        evidence += "Synthetic Test Evidence:\n"
         for i, test in enumerate(self.sm.test_history, 1):
             evidence += f"{i}. '{test.prompt[:30]}...' → {test.actual_activation:.3f} ({test.result})\n"
         

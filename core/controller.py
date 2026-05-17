@@ -5,18 +5,22 @@ Integrates state machine, prompt generator, and output validator
 
 import time
 import re
+import random
 from typing import Dict, Any, Optional, Tuple, List
 from core.state_machine import SAGEStateMachine, SAGEState, Hypothesis, TestResult, Exemplar
 from tools.prompt_generator import PromptGenerator
 from tools.output_validator import OutputValidator
 from core.agent import ask_agent, validate_agent_response
+from experiment_variants import VariantConfig, get_variant_config
 
 
 class SAGEController:
     """SAGE main controller - integrates 3-layer architecture."""
     
     def __init__(self, feature_id: int, layer: int, llm_client, tools, experiment_env,
-                 debug: bool = False, max_rounds: int = 30, top_k: int = 10):
+                 debug: bool = False, max_rounds: int = 30, top_k: int = 10,
+                 experiment_variant: str = "full", variant_config: Optional[VariantConfig] = None,
+                 random_seed: int = 0, feature_spec: Optional[Dict[str, Any]] = None):
         self.feature_id = feature_id
         self.layer = layer
         self.llm_client = llm_client
@@ -24,11 +28,32 @@ class SAGEController:
         self.experiment_env = experiment_env
         self.debug = debug
         self.top_k = top_k
+        self.experiment_variant = experiment_variant or "full"
+        self.variant_config = variant_config or get_variant_config(self.experiment_variant)
+        self.random_seed = random_seed
+        self.feature_spec = feature_spec or {
+            "layer": f"layer{layer}",
+            "layer_index": layer,
+            "feature_index": feature_id,
+        }
+        self.rng = random.Random(random_seed)
+        self.agent_actions: List[Dict[str, Any]] = []
+        self.output_audit: Dict[str, Any] = {
+            "enabled": bool(self.variant_config.output_aware),
+            "status": "not_requested" if not self.variant_config.output_aware else "pending",
+            "notes": [],
+            "evidence": [],
+        }
         
         # Initialize 3-layer architecture
         self.state_machine = SAGEStateMachine(feature_id, layer, max_rounds)
-        self.prompt_generator = PromptGenerator(self.state_machine, top_k=self.top_k)
-        self.output_validator = OutputValidator(top_k=self.top_k)
+        self.prompt_generator = PromptGenerator(
+            self.state_machine,
+            top_k=self.top_k,
+            variant_config=self.variant_config,
+        )
+        min_hypotheses = 1 if self.variant_config.max_initial_hypotheses == 1 else 3
+        self.output_validator = OutputValidator(top_k=self.top_k, min_hypotheses=min_hypotheses)
         
         # Execution statistics
         self.execution_stats = {
@@ -50,13 +75,14 @@ class SAGEController:
         
         if self.debug:
             print(f"🚀 Starting SAGE Controller for Feature {self.feature_id} at Layer {self.layer}")
+            print(f"🧪 Variant: {self.experiment_variant}")
         
         try:
             while not self.state_machine.is_final_state():
                 self._execute_round()
                 
                 # Safety check
-                if self.state_machine.round > 20:
+                if self.state_machine.round > self.state_machine.max_rounds:
                     self._force_conclude()
                     break
             
@@ -108,7 +134,10 @@ class SAGEController:
         # 其他轮次使用LLM
         # 1. 生成当前状态的Prompt
         print(f"🔄 Generating prompt for state: {current_state.value}")
+        if current_state == SAGEState.FINAL_CONCLUSION and self.variant_config.output_aware:
+            self._capture_output_aware_note()
         prompt = self.prompt_generator.generate()
+        self._record_action("prompt_generated", state=current_state.value, prompt_length=len(prompt))
         
         print(f"✅ Generated prompt ({len(prompt)} chars)")
         if self.debug:
@@ -117,6 +146,7 @@ class SAGEController:
         # 2. 调用LLM (带重试机制)
         print(f"🤖 Calling LLM (this may take a while, especially if API key is not set)...")
         llm_output = self._get_llm_response_with_retry(prompt)
+        self._record_action("llm_response", state=current_state.value, response_length=len(llm_output))
         print(f"✅ Received LLM response ({len(llm_output)} chars)")
         
         # 3. 验证输出
@@ -177,6 +207,7 @@ class SAGEController:
             
             # 直接调用实验环境获取exemplars
             tool_output = self.experiment_env.execute_experiment(f"[TOOL] text_exemplars top_k={self.top_k}")
+            self._record_action("tool_call", state=SAGEState.GET_EXEMPLARS.value, tool="text_exemplars", top_k=self.top_k)
             
             if self.debug:
                 print(f"📊 Tool execution result:")
@@ -272,6 +303,18 @@ class SAGEController:
         为所有活跃假设同时执行一个步骤（DESIGN_TEST/ANALYZE_RESULT/UPDATE_HYPOTHESIS）
         每个假设独立维护自己的状态和循环
         """
+        if not self.variant_config.active_testing:
+            self._record_action(
+                "variant_skip",
+                state=SAGEState.PARALLEL_HYPOTHESIS_TESTING.value,
+                reason="active_testing_disabled",
+            )
+            for hypothesis in self.state_machine.hypotheses:
+                if hypothesis.status == "PENDING":
+                    hypothesis.status = "UNCHANGED"
+            self.state_machine.transition(SAGEState.REVIEW_ALL_HYPOTHESES)
+            return True
+
         # Check是否有补充测试需要执行（来自REVIEW）
         if hasattr(self.state_machine, 'supplemental_tests') and self.state_machine.supplemental_tests:
             if self.debug:
@@ -361,13 +404,35 @@ class SAGEController:
             self.state_machine.state = SAGEState.DESIGN_TEST
             prompt = self.prompt_generator.generate()
             self.state_machine.state = old_state  # Restore state
+            self._record_action(
+                "prompt_generated",
+                state=SAGEState.DESIGN_TEST.value,
+                hypothesis_id=hypothesis.id,
+                prompt_length=len(prompt),
+            )
 
             if self.debug:
                 print(f"   Generated prompt ({len(prompt)} chars)")
             
             # 2. 调用LLM获取测试设计（添加假设标识，避免混淆）
             prompt_with_id = f"[DESIGNING TEST FOR HYPOTHESIS {hypothesis.id} ONLY]\n{prompt}"
-            llm_output = self._get_llm_response_with_retry(prompt_with_id)
+            if not self.variant_config.targeted_tests:
+                llm_output = self._generate_variant_test_design(hypothesis)
+                self.tools.update_log(role='assistant', content=llm_output)
+                self._record_action(
+                    "variant_generated_test",
+                    hypothesis_id=hypothesis.id,
+                    variant=self.experiment_variant,
+                    output=llm_output,
+                )
+            else:
+                llm_output = self._get_llm_response_with_retry(prompt_with_id)
+                self._record_action(
+                    "llm_response",
+                    state=SAGEState.DESIGN_TEST.value,
+                    hypothesis_id=hypothesis.id,
+                    response_length=len(llm_output),
+                )
             
             # 3. 验证输出
             is_valid, error_msg = self.output_validator.validate(SAGEState.DESIGN_TEST, llm_output)
@@ -430,6 +495,12 @@ class SAGEController:
             self.state_machine.state = SAGEState.ANALYZE_RESULT
             prompt = self.prompt_generator.generate()
             self.state_machine.state = old_state  # Restore state
+            self._record_action(
+                "prompt_generated",
+                state=SAGEState.ANALYZE_RESULT.value,
+                hypothesis_id=hypothesis.id,
+                prompt_length=len(prompt),
+            )
 
             if self.debug:
                 print(f"   Generated prompt ({len(prompt)} chars)")
@@ -442,6 +513,12 @@ class SAGEController:
             # 2. 调用LLM分析结果（添加假设标识到prompt，避免混淆）
             prompt_with_id = f"[ANALYZING HYPOTHESIS {hypothesis.id} ONLY]\n{prompt}"
             llm_output = self._get_llm_response_with_retry(prompt_with_id)
+            self._record_action(
+                "llm_response",
+                state=SAGEState.ANALYZE_RESULT.value,
+                hypothesis_id=hypothesis.id,
+                response_length=len(llm_output),
+            )
             
             # 3. 验证输出
             is_valid, error_msg = self.output_validator.validate(SAGEState.ANALYZE_RESULT, llm_output)
@@ -488,6 +565,12 @@ class SAGEController:
             self.state_machine.state = SAGEState.UPDATE_HYPOTHESIS
             prompt = self.prompt_generator.generate()
             self.state_machine.state = old_state  # Restore state
+            self._record_action(
+                "prompt_generated",
+                state=SAGEState.UPDATE_HYPOTHESIS.value,
+                hypothesis_id=hypothesis.id,
+                prompt_length=len(prompt),
+            )
 
             if self.debug:
                 print(f"   Generated prompt ({len(prompt)} chars)")
@@ -495,6 +578,12 @@ class SAGEController:
             # 2. 调用LLM更新假设（添加假设标识，避免混淆）
             prompt_with_id = f"[UPDATING HYPOTHESIS {hypothesis.id} ONLY]\n{prompt}"
             llm_output = self._get_llm_response_with_retry(prompt_with_id)
+            self._record_action(
+                "llm_response",
+                state=SAGEState.UPDATE_HYPOTHESIS.value,
+                hypothesis_id=hypothesis.id,
+                response_length=len(llm_output),
+            )
             
             # 3. 验证输出
             is_valid, error_msg = self.output_validator.validate(SAGEState.UPDATE_HYPOTHESIS, llm_output)
@@ -614,6 +703,13 @@ class SAGEController:
         # 转义prompt中的单引号，以便在命令字符串中正确使用
         escaped_prompt = test_prompt.replace("'", "\\'")
         execution_output = self.experiment_env.execute_experiment(f"[TOOL] model.run prompt='{escaped_prompt}'")
+        self._record_action(
+            "tool_call",
+            state=SAGEState.RUN_TEST.value,
+            tool="model.run",
+            hypothesis_id=hypothesis_id,
+            prompt=test_prompt,
+        )
         
         if self.debug:
             print(f"📈 Test execution result:")
@@ -644,6 +740,13 @@ class SAGEController:
             if self.debug:
                 print(f"📊 Parsed test result: prompt='{test_result.prompt}', activation={test_result.actual_activation}, hypothesis_id={test_result.hypothesis_id}")
                 print(f"   ✅ Test execution output saved and added to tools log for H{hypothesis_id}")
+            self._record_action(
+                "activation_result",
+                hypothesis_id=hypothesis_id,
+                prompt=test_result.prompt,
+                activation=test_result.actual_activation,
+                result=test_result.result,
+            )
     
     def _parse_exemplars_from_output(self, tool_output: str) -> List:
         """从工具输出中解析exemplars数据"""
@@ -1005,10 +1108,13 @@ This feature requires further investigation due to insufficient data.
             if self.debug:
                 print(f"💡 Parsing hypotheses from Round 2 analysis:")
             hypotheses = self.output_validator.extract_hypotheses(output)
+            if self.variant_config.max_initial_hypotheses > 0:
+                hypotheses = hypotheses[: self.variant_config.max_initial_hypotheses]
             for hyp in hypotheses:
                 self.state_machine.add_hypothesis(hyp["text"])
                 if self.debug:
                     print(f"   Added hypothesis: {hyp['text']}")
+                self._record_action("hypothesis_added", hypothesis_text=hyp["text"])
         
         elif state == SAGEState.FORM_HYPOTHESIS:
             # Parse假设
@@ -1016,6 +1122,8 @@ This feature requires further investigation due to insufficient data.
                 print(f"💡 Hypothesis formation:")
                 print(output)
             hypotheses = self.output_validator.extract_hypotheses(output)
+            if self.variant_config.max_initial_hypotheses > 0:
+                hypotheses = hypotheses[: self.variant_config.max_initial_hypotheses]
             for hyp in hypotheses:
                 self.state_machine.add_hypothesis(hyp["text"])
                 if self.debug:
@@ -1111,6 +1219,14 @@ This feature requires further investigation due to insufficient data.
                 hyp_id = hyp_update.get("hypothesis_id")
                 status = hyp_update.get("status")
                 refined_text = hyp_update.get("refined_text")
+                if status == "REFINED" and not self.variant_config.allow_refinement:
+                    refined_text = None
+                    status = "UNCHANGED"
+                    self._record_action(
+                        "variant_blocked_refinement",
+                        hypothesis_id=hyp_id,
+                        variant=self.experiment_variant,
+                    )
                 
                 # In ... mode，优先使用current_hypothesis_id
                 if not hyp_id and hypothesis_id:
@@ -1160,6 +1276,8 @@ This feature requires further investigation due to insufficient data.
         
         elif state == SAGEState.FINAL_CONCLUSION:
             # Save最终结论
+            if self.variant_config.output_aware:
+                self._capture_output_aware_note()
             self.state_machine.add_analysis(output)
     
     def _parse_exemplars(self, execution_output: str):
@@ -1253,6 +1371,8 @@ This feature requires further investigation due to insufficient data.
             return SAGEState.ANALYZE_EXEMPLARS
         
         if current == SAGEState.ANALYZE_EXEMPLARS:
+            if self.variant_config.direct_to_final_after_hypotheses:
+                return SAGEState.FINAL_CONCLUSION
             # 进入并行假设测试
             return SAGEState.PARALLEL_HYPOTHESIS_TESTING
         
@@ -1499,6 +1619,10 @@ This feature requires further investigation due to insufficient data.
             duration = self.execution_stats["end_time"] - self.execution_stats["start_time"]
         
         return {
+            "experiment_variant": self.experiment_variant,
+            "variant_config": self.variant_config.to_dict(),
+            "feature_spec": self.feature_spec,
+            "random_seed": self.random_seed,
             "feature_id": self.feature_id,
             "layer": self.layer,
             "final_state": self.state_machine.state.value,
@@ -1524,6 +1648,10 @@ This feature requires further investigation due to insufficient data.
                 }
                 for t in self.state_machine.test_history
             ],
+            "agent_actions": self.agent_actions,
+            "failure_mode": self._infer_failure_mode(),
+            "output_audit": self.output_audit,
+            "experiment_trace": self._build_experiment_trace(),
             "analysis_history": self.state_machine.analysis_history,
             "state_info": self.state_machine.get_state_info()
         }
@@ -1576,6 +1704,134 @@ This feature requires further investigation due to insufficient data.
                 unique_tests.append(test)
 
         return unique_tests
+
+    def _record_action(self, action: str, **kwargs):
+        """Record a compact agent/tool action for audit traces."""
+        item = {
+            "idx": len(self.agent_actions) + 1,
+            "round": self.state_machine.round,
+            "action": action,
+            "timestamp": time.time(),
+        }
+        item.update(kwargs)
+        self.agent_actions.append(item)
+
+    def _generate_variant_test_design(self, hypothesis: Hypothesis) -> str:
+        """Generate a deterministic non-targeted test for random_test ablations."""
+        candidates = []
+        if self.state_machine.exemplars:
+            candidates.extend(ex.text for ex in self.state_machine.exemplars if getattr(ex, "text", ""))
+        candidates.extend([
+            "The quick brown fox jumps over the lazy dog.",
+            "This sentence is a neutral control example.",
+            "A short paragraph describes an ordinary event.",
+            "Numbers like 123 and punctuation appear here.",
+        ])
+        prompt = self.rng.choice(candidates) if candidates else "This is a neutral control sentence."
+        prompt = " ".join(prompt.replace("\n", " ").split())
+        if len(prompt) > 180:
+            prompt = prompt[:180].rsplit(" ", 1)[0]
+        escaped = prompt.replace("'", "\\'")
+        return (
+            f"TESTING HYPOTHESIS: Non-targeted diagnostic probe for H{hypothesis.id}\n"
+            f"[TOOL] model.run prompt='{escaped}'\n"
+            "EXPECTED: Unknown activation; this ablation tests whether targeted test design is necessary."
+        )
+
+    def _capture_output_aware_note(self):
+        """Record output-aware audit availability for the current run."""
+        if self.output_audit.get("status") == "completed":
+            return
+        system = getattr(self.tools, "system", None)
+        if getattr(system, "use_api_for_activations", False):
+            self.output_audit["status"] = "unavailable_api_mode"
+            self.output_audit["notes"].append(
+                "Output/logit/steering evidence requires a local model; Neuronpedia API mode only supports activation traces."
+            )
+        elif not getattr(system, "model", None) or not getattr(system, "tokenizer", None):
+            self.output_audit["status"] = "unavailable_no_local_model"
+            self.output_audit["notes"].append(
+                "Local model or tokenizer was not loaded, so output-aware validation could not be computed."
+            )
+        else:
+            self.output_audit["status"] = "available_not_implemented"
+            self.output_audit["notes"].append(
+                "Local model is available; implement logit-lens/steering probes here for the next Agent4Interp iteration."
+            )
+
+    def _infer_failure_mode(self) -> str:
+        if self.state_machine.exemplars and all(getattr(ex, "activation", 0.0) <= 0 for ex in self.state_machine.exemplars):
+            return "dead_or_suppression_feature"
+        if not self.state_machine.hypotheses:
+            return "no_hypotheses_generated"
+        if self.variant_config.active_testing and not self.state_machine.test_history:
+            return "no_tests_executed"
+        if not any("[DESCRIPTION]:" in item for item in self.state_machine.analysis_history):
+            return "no_valid_conclusion"
+        confirmed = [h for h in self.state_machine.hypotheses if h.status == "CONFIRMED"]
+        if self.variant_config.active_testing and not confirmed:
+            return "no_confirmed_hypothesis"
+        return "none"
+
+    def _build_experiment_trace(self) -> Dict[str, Any]:
+        exemplars = []
+        for i, ex in enumerate(self.state_machine.exemplars or [], 1):
+            exemplars.append({
+                "rank": i,
+                "text": getattr(ex, "text", ""),
+                "activation": getattr(ex, "activation", 0.0),
+                "tokens": getattr(ex, "tokens", []),
+                "per_token_activations": getattr(ex, "per_token_activations", []),
+            })
+
+        hypotheses = []
+        for h in self.state_machine.hypotheses:
+            hypotheses.append({
+                "id": h.id,
+                "initial_text": h.initial_text,
+                "current_text": h.text,
+                "status": h.status,
+                "tests": [
+                    {
+                        "id": t.id,
+                        "prompt": t.prompt,
+                        "expected": t.expected,
+                        "activation": t.actual_activation,
+                        "result": t.result,
+                    }
+                    for t in h.test_history
+                ],
+                "refinement_decisions": [
+                    item for item in h.analysis_history
+                    if "HYPOTHESIS UPDATES:" in item or "UPDATED HYPOTHESIS STATUS:" in item
+                ],
+            })
+
+        final_explanation = ""
+        for item in reversed(self.state_machine.analysis_history):
+            if "[DESCRIPTION]:" in item:
+                final_explanation = item
+                break
+
+        return {
+            "feature_spec": self.feature_spec,
+            "variant": self.experiment_variant,
+            "variant_config": self.variant_config.to_dict(),
+            "exemplar_observation": exemplars,
+            "hypotheses": hypotheses,
+            "designed_tests": [
+                {"id": t.id, "hypothesis_id": t.hypothesis_id, "prompt": t.prompt, "expected": t.expected}
+                for t in self.state_machine.test_history
+            ],
+            "activation_results": [
+                {"id": t.id, "hypothesis_id": t.hypothesis_id, "activation": t.actual_activation, "result": t.result}
+                for t in self.state_machine.test_history
+            ],
+            "agent_actions": self.agent_actions,
+            "output_audit": self.output_audit,
+            "failure_mode": self._infer_failure_mode(),
+            "final_explanation": final_explanation,
+        }
 
     def _execute_supplemental_tests(self):
         """执行REVIEW建议的补充测试"""
@@ -1677,7 +1933,7 @@ This feature requires further investigation due to insufficient data.
                 if status in valid_statuses:
                     # 默认更新第一个假设
                     updates.append({
-                        "hypothesis_id": 1,
+                        "hypothesis_id": self.state_machine.current_hypothesis_id or 1,
                         "status": status,
                         "refined_text": None
                     })

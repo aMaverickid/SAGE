@@ -43,9 +43,16 @@ from dataclasses import dataclass
 # Lazy initialization for OpenAI client (to avoid requiring API key at import time)
 _openai_client = None
 
-def get_openai_client():
-    """Get or create OpenAI client (lazy initialization)"""
+def get_openai_client(base_url: str = None, api_key: str = None) -> OpenAI:
+    """Get or create OpenAI client (lazy initialization).
+
+    If api_key is provided a fresh client is returned without touching the
+    global cache, so callers that need a different key don't interfere with
+    the rest of the code.
+    """
     global _openai_client
+    if api_key is not None and base_url is not None:
+        return OpenAI(base_url=base_url, api_key=api_key)
     if _openai_client is None:
         _openai_client = OpenAI()
     return _openai_client
@@ -64,22 +71,97 @@ class TextWithActivation:
 # (From test_logprobs_evaluation.py)
 # ============================================================================
 
-def get_activation_logprobs(explanation: str, token: str, context_before: str = "") -> Tuple[dict, Dict[str, int]]:
-    """
-    Get activation value prediction logprobs for a single token.
+# def get_activation_logprobs(explanation: str, token: str, context_before: str = "", api_key: str = None) -> Tuple[dict, Dict[str, int]]:
+#     """
+#     Get activation value prediction logprobs for a single token.
 
-    Uses GPT-4 with logprobs to predict activation values (0-10) for a token
-    based on the feature explanation and context.
+#     Uses GPT-4 with logprobs to predict activation values (0-10) for a token
+#     based on the feature explanation and context.
 
-    Args:
-        explanation: Natural language explanation of neuron behavior
-        token: Token to predict activation value for
-        context_before: Context before the token
+#     Args:
+#         explanation: Natural language explanation of neuron behavior
+#         token: Token to predict activation value for
+#         context_before: Context before the token
+#         api_key: Optional OpenAI API key; uses the global client when omitted
 
-    Returns:
-        dict: {activation_value: probability}
-    """
-    # Construct prompt for LLM to predict activation value (0-10)
+#     Returns:
+#         dict: {activation_value: probability}
+#     """
+#     # Construct prompt for LLM to predict activation value (0-10)
+#     prompt = f"""You are a neuron simulator.
+
+# Neuron behavior rules: {explanation}
+
+# Task: Predict the activation value (0-10 integer, 0 means no activation, 10 means strongest activation) for a token.
+
+# Context: {context_before if context_before else "None"}
+# Current token: {token}
+
+# Please output only a number between 0-10, representing the activation value:"""
+
+#     client = get_openai_client(api_key=api_key)
+#     response = client.chat.completions.create(
+#         model="gpt-4o",
+#         # model="gpt-5",
+#         # model="gpt-4.1",
+#         # model="deepseek-v4-pro",
+#         messages=[
+#             {"role": "user", "content": prompt}
+#         ],
+#         logprobs=True,
+#         top_logprobs=10,  # Get top 20 most likely tokens
+#         max_tokens=1,      # Only need first token
+#         temperature=1.0    # Use default temperature for true probability distribution
+#     )
+
+#     # Get token usage
+#     token_usage = {
+#         'prompt_tokens': response.usage.prompt_tokens if response.usage else 0,
+#         'completion_tokens': response.usage.completion_tokens if response.usage else 0,
+#         'total_tokens': response.usage.total_tokens if response.usage else 0
+#     }
+
+#     # Calculate cost for GPT-4o
+#     # Prices: Input $1.25/1M, Output $5.00/1M
+#     cost_input = (token_usage['prompt_tokens'] / 1_000_000) * 1.25
+#     cost_output = (token_usage['completion_tokens'] / 1_000_000) * 5.00
+#     cost_total = cost_input + cost_output
+#     token_usage['cost_input'] = cost_input
+#     token_usage['cost_output'] = cost_output
+#     token_usage['cost_total'] = cost_total
+
+#     # Parse logprobs
+#     if not response.choices[0].logprobs or not response.choices[0].logprobs.content:
+#         print(f"Warning: No logprobs obtained for token '{token}'")
+#         return {}, token_usage
+
+#     # Get top logprobs for first generated token
+#     first_token_logprobs = response.choices[0].logprobs.content[0].top_logprobs
+
+#     # Extract 0-10 probability distribution
+#     activation_probs = {}
+
+#     for logprob_item in first_token_logprobs:
+#         token_str = logprob_item.token.strip()
+#         logprob_value = logprob_item.logprob
+
+#         # Check if it's a digit 0-10
+#         if token_str.isdigit():
+#             activation_value = int(token_str)
+#             if 0 <= activation_value <= 10:
+#                 # Convert from log probability to probability: P = e^(log P)
+#                 probability = math.exp(logprob_value)
+#                 activation_probs[activation_value] = probability
+
+#     return activation_probs, token_usage
+
+def get_activation_logprobs(
+    explanation: str,
+    token: str,
+    context_before: str = "",
+    api_key: str = None
+) -> Tuple[dict, Dict[str, int]]:
+
     prompt = f"""You are a neuron simulator.
 
 Neuron behavior rules: {explanation}
@@ -91,60 +173,73 @@ Current token: {token}
 
 Please output only a number between 0-10, representing the activation value:"""
 
-    # Call Chat API with logprobs
-    client = get_openai_client()
-    response = client.chat.completions.create(
+    base_url = os.getenv("DMX_API_BASE_URL", "https://www.dmxapi.cn/v1")
+    api_key = api_key or os.getenv("DMX_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "Missing API key for activation logprob prediction. "
+            "Set DMX_API_KEY or OPENAI_API_KEY, or pass api_key explicitly."
+        )
+    client = get_openai_client(base_url=base_url, api_key=api_key)
+
+    stream = client.chat.completions.create(
         model="gpt-4o",
+        # model="deepseek-v4-pro",
+        # model="deepseek-v4-flash",
         messages=[
             {"role": "user", "content": prompt}
         ],
         logprobs=True,
-        top_logprobs=10,  # Get top 20 most likely tokens
-        max_tokens=1,      # Only need first token
-        temperature=1.0    # Use default temperature for true probability distribution
+        top_logprobs=10,
+        max_tokens=1,
+        temperature=1.0,
+        stream=True,
     )
 
-    # Get token usage
-    token_usage = {
-        'prompt_tokens': response.usage.prompt_tokens if response.usage else 0,
-        'completion_tokens': response.usage.completion_tokens if response.usage else 0,
-        'total_tokens': response.usage.total_tokens if response.usage else 0
-    }
-    
-    # Calculate cost for GPT-4o
-    # Prices: Input $1.25/1M, Output $5.00/1M
-    cost_input = (token_usage['prompt_tokens'] / 1_000_000) * 1.25
-    cost_output = (token_usage['completion_tokens'] / 1_000_000) * 5.00
-    cost_total = cost_input + cost_output
-    token_usage['cost_input'] = cost_input
-    token_usage['cost_output'] = cost_output
-    token_usage['cost_total'] = cost_total
-    
-    # Parse logprobs
-    if not response.choices[0].logprobs or not response.choices[0].logprobs.content:
-        print(f"Warning: No logprobs obtained for token '{token}'")
-        return {}, token_usage
-
-    # Get top logprobs for first generated token
-    first_token_logprobs = response.choices[0].logprobs.content[0].top_logprobs
-
-    # Extract 0-10 probability distribution
     activation_probs = {}
 
-    for logprob_item in first_token_logprobs:
-        token_str = logprob_item.token.strip()
-        logprob_value = logprob_item.logprob
+    token_usage = {
+        'prompt_tokens': 0,
+        'completion_tokens': 0,
+        'total_tokens': 0
+    }
 
-        # Check if it's a digit 0-10
-        if token_str.isdigit():
-            activation_value = int(token_str)
-            if 0 <= activation_value <= 10:
-                # Convert from log probability to probability: P = e^(log P)
-                probability = math.exp(logprob_value)
-                activation_probs[activation_value] = probability
+    for chunk in stream:
+
+        if hasattr(chunk, "usage") and chunk.usage:
+            token_usage = {
+                'prompt_tokens': chunk.usage.prompt_tokens,
+                'completion_tokens': chunk.usage.completion_tokens,
+                'total_tokens': chunk.usage.total_tokens
+            }
+
+        if not chunk.choices:
+            continue
+
+        choice = chunk.choices[0]
+
+        if not hasattr(choice, "logprobs") or not choice.logprobs:
+            continue
+
+        if not choice.logprobs.content:
+            continue
+
+        top_logprobs = choice.logprobs.content[0].top_logprobs
+
+        for item in top_logprobs:
+            token_str = item.token.strip()
+            logprob_value = item.logprob
+
+            if token_str.isdigit():
+                activation_value = int(token_str)
+
+                if 0 <= activation_value <= 10:
+                    activation_probs[activation_value] = math.exp(logprob_value)
+
+        if activation_probs:
+            break
 
     return activation_probs, token_usage
-
 
 def compute_expected_activation(activation_probs: dict) -> float:
     """
@@ -172,7 +267,8 @@ def compute_expected_activation(activation_probs: dict) -> float:
 def predict_activations_with_logprobs(
     explanation: str,
     tokens: List[str],
-    show_details: bool = False
+    show_details: bool = False,
+    api_key: str = None,
 ) -> Tuple[List[float], Dict[str, int]]:
     """
     Use logprobs to predict activation values for a series of tokens.
@@ -181,6 +277,7 @@ def predict_activations_with_logprobs(
         explanation: Neuron behavior explanation
         tokens: List of tokens
         show_details: Whether to print detailed information
+        api_key: Optional OpenAI API key; uses the global client when omitted
 
     Returns:
         Tuple of (predicted activation values, token usage dict)
@@ -191,8 +288,8 @@ def predict_activations_with_logprobs(
 
     for i, token in enumerate(tokens):
         # Get logprobs probability distribution
-        activation_probs, token_usage = get_activation_logprobs(explanation, token, context)
-        
+        activation_probs, token_usage = get_activation_logprobs(explanation, token, context, api_key=api_key)
+
         # Accumulate token usage
         total_token_usage['prompt_tokens'] += token_usage['prompt_tokens']
         total_token_usage['completion_tokens'] += token_usage['completion_tokens']
@@ -235,26 +332,26 @@ def delete_neuronpedia_explanation(
 ) -> bool:
     """
     Delete a Neuronpedia explanation by ID.
-    
+
     API Documentation: https://www.neuronpedia.org/api-doc#tag/explanations/post/api/explanation/{explanationId}/delete
-    
+
     Args:
         explanation_id: Explanation ID to delete
         api_key: Neuronpedia API key
-    
+
     Returns:
         bool: True if deletion was successful, False otherwise
     """
     url = f"https://www.neuronpedia.org/api/explanation/{explanation_id}/delete"
-    
+
     headers = {
         "x-api-key": api_key
     }
-    
+
     try:
         print(f"   🗑️  Deleting existing explanation (ID: {explanation_id})...")
         response = requests.post(url, headers=headers, timeout=30)
-        
+
         if response.status_code == 200:
             print(f"   ✅ Explanation successfully deleted")
             return True
@@ -266,7 +363,7 @@ def delete_neuronpedia_explanation(
             except:
                 print(f"      Response: {response.text[:200]}")
             return False
-            
+
     except requests.exceptions.RequestException as e:
         print(f"   ❌ Error deleting explanation: {e}")
         return False
@@ -341,12 +438,12 @@ def call_neuronpedia_api(
             try:
                 error_data = response.json()
                 error_message = error_data.get("message", "").lower()
-                
+
                 if "already exists" in error_message:
                     print(f"   ⚠️  Explanation already exists (this is normal)")
                     print(f"   Message: {error_data.get('message')}")
                     print(f"   💡 Trying to fetch existing explanation from API...")
-                    
+
                     # Try to get the existing explanation using GET API
                     get_url = f"https://www.neuronpedia.org/api/feature/{model_id}/{layer}/{feature_index}"
                     try:
@@ -354,9 +451,9 @@ def call_neuronpedia_api(
                         if get_response.status_code == 200:
                             feature_data = get_response.json()
                             explanations = feature_data.get("explanations", [])
-                            
+
                             print(f"   📋 Found {len(explanations)} explanation(s) in API response")
-                            
+
                             # Show all available explanations
                             for i, exp in enumerate(explanations, 1):
                                 exp_model = exp.get("explanationModelName", "unknown")
@@ -364,7 +461,7 @@ def call_neuronpedia_api(
                                 exp_desc = exp.get("description", "")[:80] + "..." if len(exp.get("description", "")) > 80 else exp.get("description", "")
                                 print(f"      {i}. Model: {exp_model}, Type: {exp_type}")
                                 print(f"         Description: {exp_desc}")
-                            
+
                             # Find the matching explanation
                             matching_exp = None
                             for exp in explanations:
@@ -372,7 +469,7 @@ def call_neuronpedia_api(
                                     exp.get("typeName") == explanation_type):
                                     matching_exp = exp
                                     break
-                            
+
                             if matching_exp:
                                 explanation_id = matching_exp.get('id', 'N/A')
                                 print(f"   ✅ Found matching explanation (Model: {explanation_model_name}, Type: {explanation_type})")
@@ -383,13 +480,13 @@ def call_neuronpedia_api(
                                 if matching_exp.get('triggeredByUser'):
                                     user_info = matching_exp.get('triggeredByUser', {})
                                     print(f"      Triggered by: {user_info.get('name', 'N/A')} (ID: {user_info.get('id', 'N/A')})")
-                                
+
                                 # Check if explanation file exists locally
                                 explanation_file_exists = False
                                 if output_dir:
                                     explanation_file = os.path.join(output_dir, f'feature_{feature_index}_neuronpedia_explanation.json')
                                     explanation_file_exists = os.path.exists(explanation_file)
-                                
+
                                 # If force_regenerate is True, or if explanation doesn't exist locally, delete and regenerate
                                 if force_regenerate or not explanation_file_exists:
                                     if not explanation_file_exists:
@@ -397,17 +494,17 @@ def call_neuronpedia_api(
                                         print(f"      Will delete existing explanation and regenerate...")
                                     else:
                                         print(f"   💡 Force regenerate requested, will delete existing explanation and regenerate...")
-                                    
+
                                     # Delete the existing explanation
                                     if delete_neuronpedia_explanation(explanation_id, api_key):
                                         # Wait a bit for deletion to propagate
                                         import time
                                         time.sleep(2)
-                                        
+
                                         # Retry generating the explanation
                                         print(f"   🔄 Retrying explanation generation...")
                                         retry_response = requests.post(url, headers=headers, json=payload, timeout=120)
-                                        
+
                                         if retry_response.status_code == 200:
                                             result = retry_response.json()
                                             print(f"   ✅ Neuronpedia API call successful (new explanation created after deletion)")
@@ -427,7 +524,7 @@ def call_neuronpedia_api(
                                             return None  # Return None to indicate failure
                                     else:
                                         print(f"   ⚠️  Failed to delete explanation, will use existing one")
-                                
+
                                 # Return complete data for export
                                 return {
                                     "explanation": matching_exp,
@@ -456,7 +553,7 @@ def call_neuronpedia_api(
                         print(f"   ⚠️  Could not fetch existing explanation: {e}")
                         import traceback
                         traceback.print_exc()
-                    
+
                     # Return error info if we can't get existing explanation
                     return {"error": "explanation_exists", "message": error_data.get("message")}
                 elif "unsupported explanation model" in error_message:
@@ -563,10 +660,10 @@ def extract_sage_conclusion(results_path: str) -> Dict[str, Any]:
 def extract_layer_number(layer: str) -> int:
     """
     Extract layer number from layer identifier string.
-    
+
     Args:
         layer: Layer identifier string (e.g., "11-resid-post-aa", "0-gemmascope-mlp-16k", "0")
-    
+
     Returns:
         Layer number as integer
     """
@@ -602,7 +699,7 @@ def format_neuronpedia_explanation(neuronpedia_result: Dict[str, Any]) -> Dict[s
     # Check for error cases - raise exceptions instead of returning fake data
     if neuronpedia_result is None:
         raise ValueError("Neuronpedia API returned None - failed to get explanation")
-    
+
     if isinstance(neuronpedia_result, dict) and 'error' in neuronpedia_result:
         error_msg = neuronpedia_result.get('message', 'Unknown error')
         raise ValueError(f"Neuronpedia API returned error: {error_msg}")
@@ -614,7 +711,7 @@ def format_neuronpedia_explanation(neuronpedia_result: Dict[str, Any]) -> Dict[s
     if isinstance(neuronpedia_result, dict):
         # Try to get explanation object
         explanation_obj = neuronpedia_result.get('explanation')
-        
+
         if explanation_obj and isinstance(explanation_obj, dict):
             # Extract description from explanation object
             explanation_text = explanation_obj.get('description', '')
@@ -650,7 +747,7 @@ def get_activation_exemplars_from_api(
 ) -> List[Dict[str, Any]]:
     """
     Get activation exemplars from Neuronpedia API.
-    
+
     Args:
         model_id: Model ID (e.g., "gpt2-small", "gemma-2-2b")
         source: SAE ID/source (e.g., "9-res-jb", "6-gemmascope-mlp-16k")
@@ -660,7 +757,7 @@ def get_activation_exemplars_from_api(
                      This determines the context window around the max activation token
         return_all: If True, return all exemplars from API (sorted by activation descending)
                     If False, return top_k exemplars (default: top 10 if top_k is None)
-    
+
     Returns:
         List of dicts with keys: {
             'text': str (buffer text around max activation token),
@@ -671,79 +768,79 @@ def get_activation_exemplars_from_api(
             'values': List[float] (activation values for tokens in buffer),
             'full_text': str (original full text from API, no filtering)
         }, sorted by activation (descending)
-    
+
     Raises:
         requests.exceptions.RequestException: If API call fails
         ValueError: If API returns invalid response
     """
     url = "https://www.neuronpedia.org/api/activation/get"
-    
+
     headers = {
         "Content-Type": "application/json"
     }
-    
+
     payload = {
         "modelId": model_id,
         "source": source,
         "index": str(feature_index)
     }
-    
+
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
-        
+
         result = response.json()
-        
+
         # API returns a list of activation objects
         if not isinstance(result, list):
             raise ValueError(f"Expected list from API, got {type(result)}")
-        
+
         # Process each activation object
         exemplars = []
-        
+
         for activation_obj in result:
             if not isinstance(activation_obj, dict):
                 continue
-            
+
             # Extract tokens and values from API (original, no filtering)
             tokens = activation_obj.get('tokens', [])
             values = activation_obj.get('values', [])
             max_value = activation_obj.get('maxValue', 0.0)
             max_value_token_index = activation_obj.get('maxValueTokenIndex', 0)
-            
+
             # Skip if no tokens or values
             if not tokens or not values:
                 continue
-            
+
             # Validate index
             if max_value_token_index >= len(tokens) or max_value_token_index >= len(values):
                 # Invalid index, skip this exemplar
                 continue
-            
+
             # Get the original full text (no filtering)
             full_text = ''.join(tokens)
-            
+
             # Get max token from original tokens
             max_token = tokens[max_value_token_index] if max_value_token_index < len(tokens) else ""
-            
+
             # Build buffer region around max activation token
             # buffer_size tokens before and after the max token
             start_idx = max(0, max_value_token_index - buffer_size)
             end_idx = min(len(tokens), max_value_token_index + buffer_size + 1)
-            
+
             # Extract buffer tokens and values
             buffer_tokens = tokens[start_idx:end_idx]
             buffer_values = values[start_idx:end_idx]
-            
+
             # Calculate relative index of max token in buffer
             buffer_max_idx = max_value_token_index - start_idx
-            
+
             # Build buffer text (concatenate buffer tokens)
             buffer_text = ''.join(buffer_tokens)
-            
+
             # Use maxValue as the activation value
             activation = float(max_value)
-            
+
             exemplars.append({
                 'text': buffer_text,  # Buffer text around max activation token
                 'activation': activation,  # Max activation value
@@ -753,16 +850,16 @@ def get_activation_exemplars_from_api(
                 'values': buffer_values,  # Activation values for buffer tokens
                 'full_text': full_text  # Original full text (no filtering)
             })
-        
+
         # Sort by activation (descending)
         exemplars.sort(key=lambda x: x['activation'], reverse=True)
-        
+
         if len(exemplars) == 0:
             print(f"   ⚠️  Warning: No valid exemplars found")
             print(f"      This may indicate that the API returned no activation data")
             # Raise exception instead of returning empty list
             raise ValueError("No valid exemplars found from API. API may have returned empty results.")
-        
+
         # Determine how many to return
         if return_all:
             # Return all exemplars
@@ -774,9 +871,9 @@ def get_activation_exemplars_from_api(
                 top_k = 10
             result_exemplars = exemplars[:top_k]
             print(f"   ✅ Retrieved {len(result_exemplars)} exemplars from Neuronpedia API (top {top_k} of {len(exemplars)} total)")
-        
+
         print(f"      Activation range: [{exemplars[-1]['activation']:.4f}, {exemplars[0]['activation']:.4f}]")
-        
+
         # Show sample exemplars with buffer text and token activations
         if len(result_exemplars) > 0:
             num_to_show = min(5, len(result_exemplars))
@@ -788,9 +885,9 @@ def get_activation_exemplars_from_api(
                 buffer_tokens = exemplar.get('tokens', [])
                 buffer_values = exemplar.get('values', [])
                 buffer_max_idx = exemplar.get('max_token_index', 0)
-                
+
                 print(f"      {i}. text: {buffer_text}")
-                
+
                 # Show all tokens in buffer with their activation values
                 if buffer_tokens and buffer_values and len(buffer_tokens) == len(buffer_values):
                     token_parts = []
@@ -802,12 +899,12 @@ def get_activation_exemplars_from_api(
                             token_parts.append(f"{token} {value:.2f}")
                     tokens_str = ", ".join(token_parts)
                     print(f"         Tokens: {tokens_str}")
-                
+
                 print(f"         Max token: {max_token} {activation:.2f}")
                 print()
-        
+
         return result_exemplars
-        
+
     except requests.exceptions.HTTPError as e:
         error_msg = f"Neuronpedia API HTTP error: {e.response.status_code}"
         if e.response.text:
@@ -831,30 +928,30 @@ def categorize_exemplars_by_activation(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Categorize exemplars into high, medium, and low activation groups.
-    
+
     Args:
         all_exemplars: List of all exemplars (sorted by activation descending)
         num_high: Number of high-activating exemplars to return (default: 10)
         num_medium: Number of medium-activating exemplars to return (default: 5)
         num_low: Number of low-activating exemplars to return (default: 5)
-    
+
     Returns:
         dict with keys: 'high', 'medium', 'low', each containing a list of exemplars
     """
     if not all_exemplars:
         return {'high': [], 'medium': [], 'low': []}
-    
+
     total = len(all_exemplars)
-    
+
     # High-activating: top num_high
     high_exemplars = all_exemplars[:min(num_high, total)]
-    
+
     # Medium-activating: middle section
     # Calculate indices for medium-activating exemplars
     # Use exemplars from approximately 30% to 60% of the sorted list
     medium_start = max(num_high, int(total * 0.3))
     medium_end = min(medium_start + num_medium, int(total * 0.6))
-    
+
     if medium_end > medium_start and total > num_high:
         medium_exemplars = all_exemplars[medium_start:medium_end]
     else:
@@ -862,7 +959,7 @@ def categorize_exemplars_by_activation(
         medium_start = max(num_high, total // 3)
         medium_end = min(medium_start + num_medium, total - num_low) if total > num_low else medium_start + num_medium
         medium_exemplars = all_exemplars[medium_start:medium_end] if medium_end > medium_start and total > num_high else []
-    
+
     # Low-activating: bottom num_low
     if total > num_low:
         low_exemplars = all_exemplars[-num_low:]
@@ -871,7 +968,7 @@ def categorize_exemplars_by_activation(
         low_start = max(medium_end if len(medium_exemplars) > 0 else num_high + num_medium, int(total * 0.6))
         low_end = min(low_start + num_low, total)
         low_exemplars = all_exemplars[low_start:low_end] if low_end > low_start else []
-    
+
     return {
         'high': high_exemplars,
         'medium': medium_exemplars,
@@ -888,65 +985,65 @@ def select_exemplars_for_prediction_evaluation(
 ) -> Tuple[List[str], List[float]]:
     """
     Select exemplars for Prediction Evaluation from exemplars (excluding top N).
-    
+
     This function:
     1. Excludes the top N exemplars (used for Generation Evaluation)
     2. Uses position-based intervals to categorize remaining exemplars into high, medium, low groups
     3. Randomly selects specified number from each interval
     4. Returns buffer_text (truncated text) and their corresponding max activation values
-    
+
     Selection intervals (based on total length, excluding top N):
     - High-activating: indices [exclude_top_n, total_length * 0.4] (top 40% after excluding top N)
     - Medium-activating: indices [total_length * 0.4, total_length * 0.7] (40% to 70%)
     - Low-activating: indices [total_length * 0.7, total_length] (bottom 30%)
-    
+
     Args:
         all_exemplars: List of all exemplars (sorted by activation descending)
         exclude_top_n: Number of top exemplars to exclude (default: 10, used for Generation Evaluation)
         num_high: Number of high-activating exemplars to select (default: 4)
         num_medium: Number of medium-activating exemplars to select (default: 3)
         num_low: Number of low-activating exemplars to select (default: 3)
-    
+
     Returns:
         Tuple of (selected_texts, selected_activations) where:
-        - selected_texts: List of buffer_text strings (truncated text around max activation token, 
+        - selected_texts: List of buffer_text strings (truncated text around max activation token,
                          using buffer_size tokens before/after max token)
         - selected_activations: List of max activation values (from exemplar's 'activation' field,
                                which is the max activation value from the full text, not just buffer region)
     """
     import random
-    
+
     total_length = len(all_exemplars) if all_exemplars else 0
-    
+
     if not all_exemplars or total_length <= exclude_top_n:
         print(f"   ⚠️  Not enough exemplars to select from (need more than {exclude_top_n}, got {total_length})")
         return [], []
-    
+
     # Calculate position-based intervals (based on total length)
     # User's requirement: Use position-based intervals from sorted exemplars (by activation descending)
     # - High-activating: indices [10, total_length * 0.4] (from index 10 to 40% of total)
     # - Medium-activating: indices [total_length * 0.4, total_length * 0.7] (40% to 70% of total)
     # - Low-activating: indices [total_length * 0.7, total_length] (70% to 100% of total)
-    # 
+    #
     # Note: Since exemplars are sorted by activation descending (from API), these position-based
     # intervals correspond to activation levels:
     # - High: Relatively high activation (top 40% after excluding top 10)
     # - Medium: Medium activation (middle 30%)
     # - Low: Lower activation (bottom 30%)
-    
+
     # Calculate interval boundaries based on total length percentages
     # High-activating: indices [10, total_length * 0.4]
     #   - If total_length * 0.4 <= 10, then high interval is empty, need to adjust
     high_start = exclude_top_n  # Start from index 10 (after excluding top 10)
     high_end_idx = int(total_length * 0.4)  # 40% of total length
-    
+
     # Medium-activating: indices [total_length * 0.4, total_length * 0.7]
     medium_start_idx = int(total_length * 0.4)  # Start at 40% of total
     medium_end_idx = int(total_length * 0.7)  # Up to 70% of total
-    
+
     # Low-activating: indices [total_length * 0.7, total_length]
     low_start_idx = int(total_length * 0.7)  # Start at 70% of total
-    
+
     # Determine actual interval boundaries
     # High interval: from index 10 to 40% of total (or adjust if 40% <= 10)
     if high_end_idx > high_start:
@@ -956,7 +1053,7 @@ def select_exemplars_for_prediction_evaluation(
         # Edge case: 40% of total <= 10, need to extend high interval
         # Extend to include at least num_high candidates
         high_end = min(high_start + max(num_high, int(total_length * 0.2)), total_length)
-    
+
     # Medium interval: from 40% to 70% of total (must start after high interval ends)
     medium_start = max(medium_start_idx, high_end)  # Start after high interval ends
     if medium_end_idx > medium_start:
@@ -964,23 +1061,23 @@ def select_exemplars_for_prediction_evaluation(
     else:
         # Edge case: 70% <= medium_start, need to extend
         medium_end = min(medium_start + max(num_medium, int(total_length * 0.2)), total_length)
-    
+
     # Low interval: from 70% to 100% of total (must start after medium interval ends)
     low_start = max(low_start_idx, medium_end)  # Start after medium interval ends
     low_end = total_length  # End of list
-    
+
     # Final validation: ensure intervals are non-empty and non-overlapping
     high_end = min(max(high_end, high_start + 1), total_length)
     medium_start = max(medium_start, high_end)
     medium_end = min(max(medium_end, medium_start + 1), total_length)
     low_start = max(low_start, medium_end)
     low_end = min(low_end, total_length)
-    
+
     # Get candidates from each interval (using Python range, which is exclusive of end)
     high_candidates_indices = list(range(high_start, high_end)) if high_end > high_start else []
     medium_candidates_indices = list(range(medium_start, medium_end)) if medium_end > medium_start else []
     low_candidates_indices = list(range(low_start, low_end)) if low_end > low_start else []
-    
+
     # Validate we have enough candidates
     if len(high_candidates_indices) < num_high:
         print(f"   ⚠️  Not enough high-activating candidates: need {num_high}, got {len(high_candidates_indices)}")
@@ -991,17 +1088,17 @@ def select_exemplars_for_prediction_evaluation(
     if len(low_candidates_indices) < num_low:
         print(f"   ⚠️  Not enough low-activating candidates: need {num_low}, got {len(low_candidates_indices)}")
         print(f"      Interval: [{low_start}, {low_end}), Total length: {total_length}")
-    
+
     print(f"   📊 Position-based intervals (total length: {total_length}, excluding top {exclude_top_n}):")
     print(f"      High-activating: indices [{high_start}, {high_end}) = {len(high_candidates_indices)} candidates")
     print(f"      Medium-activating: indices [{medium_start}, {medium_end}) = {len(medium_candidates_indices)} candidates")
     print(f"      Low-activating: indices [{low_start}, {low_end}) = {len(low_candidates_indices)} candidates")
-    
+
     # Randomly select indices from each interval
     selected_texts = []
     selected_activations = []
     selected_indices = []  # For tracking which exemplars were selected
-    
+
     # Select high-activating exemplars
     if len(high_candidates_indices) >= num_high:
         selected_high_indices = random.sample(high_candidates_indices, num_high)
@@ -1025,7 +1122,7 @@ def select_exemplars_for_prediction_evaluation(
             selected_activations.append(activation)
             selected_indices.append(idx)
         print(f"   ⚠️  Selected {len(high_candidates_indices)} high-activating exemplars (less than requested {num_high})")
-    
+
     # Select medium-activating exemplars
     if len(medium_candidates_indices) >= num_medium:
         selected_medium_indices = random.sample(medium_candidates_indices, num_medium)
@@ -1047,7 +1144,7 @@ def select_exemplars_for_prediction_evaluation(
             selected_activations.append(activation)
             selected_indices.append(idx)
         print(f"   ⚠️  Selected {len(medium_candidates_indices)} medium-activating exemplars (less than requested {num_medium})")
-    
+
     # Select low-activating exemplars
     if len(low_candidates_indices) >= num_low:
         selected_low_indices = random.sample(low_candidates_indices, num_low)
@@ -1069,12 +1166,12 @@ def select_exemplars_for_prediction_evaluation(
             selected_activations.append(activation)
             selected_indices.append(idx)
         print(f"   ⚠️  Selected {len(low_candidates_indices)} low-activating exemplars (less than requested {num_low})")
-    
+
     print(f"   📊 Total selected: {len(selected_texts)} exemplars with activations")
     if selected_activations:
         print(f"      Activation range: [{min(selected_activations):.4f}, {max(selected_activations):.4f}]")
         print(f"      Selected indices: {selected_indices}")
-    
+
     # Show selected exemplars with buffer text and max activation
     print(f"\n   📋 Selected Exemplars for Prediction Evaluation (using buffer_text, truncated around max activation token):")
     for i, (text, activation, idx) in enumerate(zip(selected_texts, selected_activations, selected_indices), 1):
@@ -1083,7 +1180,7 @@ def select_exemplars_for_prediction_evaluation(
         max_token = exemplar.get('max_token', 'N/A')
         text_preview = text[:80] + "..." if len(text) > 80 else text
         print(f"      {i}. Index: {idx}, Max Activation: {activation:.4f}, Max Token: '{max_token}', Text: {text_preview}")
-    
+
     return selected_texts, selected_activations
 
 
@@ -1125,7 +1222,7 @@ def generate_examples_from_explanation(
     labels_section = ""
     if labels_text:
         labels_section = f"\nLabels:\n{labels_text}"
-    
+
     print(f"explanation: {explanation['description']}{labels_section}")
     if source == "SAGE":
          explanations =labels_section
@@ -1180,12 +1277,12 @@ IMPORTANT:
 
         # Use OpenAI client directly to get token usage
         client = get_openai_client()
-        
+
         # Map model names
         model_name = llm_model
         if model_name == 'gpt-5':
             model_name = 'gpt-5'
-        
+
         # GPT-5 models use max_completion_tokens instead of max_tokens
         if model_name.startswith('gpt-5'):
             params = {
@@ -1199,10 +1296,10 @@ IMPORTANT:
                 "messages": conversation_log,
                 "max_tokens": 4096,
             }
-        
+
         api_response = client.chat.completions.create(**params)
         response = api_response.choices[0].message.content
-        
+
         # Get token usage
         token_usage = {
             'prompt_tokens': api_response.usage.prompt_tokens if api_response.usage else 0,
@@ -1230,16 +1327,16 @@ IMPORTANT:
             print(f"      {i}. {ex}")
         if len(examples) > 3:
             print(f"      ... and {len(examples)-3} more")
-        
+
         # Calculate cost for GPT-5
         # Prices: Input $0.625/1M, Output $5.00/1M
         cost_input = (token_usage['prompt_tokens'] / 1_000_000) * 0.625
         cost_output = (token_usage['completion_tokens'] / 1_000_000) * 5.00
         cost_total = cost_input + cost_output
-        
+
         print(f"   📊 Token usage: {token_usage['prompt_tokens']} prompt + {token_usage['completion_tokens']} completion = {token_usage['total_tokens']} total")
         print(f"   💰 Cost: ${cost_total:.6f} (input: ${cost_input:.6f}, output: ${cost_output:.6f})")
-        
+
         # Add cost to token_usage dict
         token_usage['cost_input'] = cost_input
         token_usage['cost_output'] = cost_output
@@ -1280,7 +1377,7 @@ def evaluate_examples(
         dict with evaluation metrics and detailed results
     """
     print(f"\n📊 Evaluating {len(examples)} examples (threshold: {activation_threshold})...")
-    
+
     if use_api:
         if not all([model_id, layer, feature_index is not None]):
             raise ValueError("API mode requires model_id, layer, and feature_index")
@@ -1300,7 +1397,7 @@ def evaluate_examples(
                 # Show progress for API calls
                 if i % 2 == 0 or i == len(examples):
                     print(f"   Getting activation {i}/{len(examples)}...", end='\r')
-                
+
                 # Get activation from Neuronpedia API
                 # API will raise exception on failure
                 activation_data = get_activation_data_from_api(
@@ -1310,7 +1407,7 @@ def evaluate_examples(
                     custom_text=example,
                     api_key=api_key
                 )
-                
+
                 max_activation = activation_data['maxValue']
                 mean_activation = activation_data.get('meanValue', 0.0)
                 tokens = activation_data.get('tokens', [])
@@ -1361,7 +1458,7 @@ def evaluate_examples(
     # Clear progress display and print results
     if use_api:
         print()  # New line to clear progress display
-    
+
     # Print evaluation results
     for i, result in enumerate(detailed_results, 1):
         status = "✅ SUCCESS" if result['success'] else "❌ FAILED"
@@ -1453,15 +1550,15 @@ def get_activation_data_from_api(
         ValueError: If API returns invalid response
     """
     url = "https://www.neuronpedia.org/api/activation/new"
-    
+
     headers = {
         "Content-Type": "application/json"
     }
-    
+
     # Add API key if provided
     if api_key:
         headers["x-api-key"] = api_key
-    
+
     payload = {
         "feature": {
             "modelId": model_id,
@@ -1470,14 +1567,14 @@ def get_activation_data_from_api(
         },
         "customText": custom_text
     }
-    
-    max_retries = 3
-    base_delay = 2
+
+    max_retries = 5
+    base_delay = 5
 
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=30)
-            
+
             # If 5xx error, retry
             if 500 <= response.status_code < 600:
                 if attempt < max_retries - 1:
@@ -1488,20 +1585,20 @@ def get_activation_data_from_api(
                 else:
                     # Last attempt failed, raise error
                     response.raise_for_status()
-            
+
             # Raise for other error codes (4xx)
             response.raise_for_status()
-            
+
             # If successful, break loop
             break
-            
+
         except requests.exceptions.RequestException as e:
             # Check if it's a 5xx error caught by raise_for_status or connection error
             is_5xx = False
             if hasattr(e, 'response') and e.response is not None:
                 if 500 <= e.response.status_code < 600:
                     is_5xx = True
-            
+
             # Retry on 5xx or connection errors (which might not have response)
             if (is_5xx or not hasattr(e, 'response') or e.response is None) and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
@@ -1511,23 +1608,23 @@ def get_activation_data_from_api(
             else:
                 # Re-raise the last exception if no more retries
                 raise e
-        
+
     # Process response after successful retry loop
     try:
         result = response.json()
-        
+
         # Check if response contains error field
         if 'error' in result and result['error']:
             raise ValueError(f"API returned error: {result['error']}")
-        
+
         # Validate required fields
         if 'maxValue' not in result:
             raise ValueError(f"API response missing 'maxValue' field: {result}")
-        
+
         # Extract activation data
         tokens = result.get('tokens', [])
         values = result.get('values', [])
-        
+
         # Filter out special tokens and their activation values
         # These tokens are added by the API/tokenizer but shouldn't be considered in evaluation
         # Include both beginning-of-text and end-of-text tokens, as well as other common special tokens
@@ -1535,14 +1632,14 @@ def get_activation_data_from_api(
             # End-of-text tokens
             '<|endoftext|>', '<|eot_id|>', '<|eot|>', '<eos>', '</s>',
             # Beginning-of-text tokens
-            '<|begin_of_text|>', '<|beginoftext|>', '<|begin|>', '<|startoftext|>', 
+            '<|begin_of_text|>', '<|beginoftext|>', '<|begin|>', '<|startoftext|>',
             '<|start_of_text|>', '<|start|>', '<bos>', '<s>',
             # Other common special tokens
             '<pad>', '<unk>', '<mask>', '<sep>', '<cls>'
         }
         filtered_tokens = []
         filtered_values = []
-        
+
         for i, token in enumerate(tokens):
             # Skip special tokens (case-insensitive comparison after stripping)
             token_clean = token.strip()
@@ -1552,7 +1649,7 @@ def get_activation_data_from_api(
             filtered_tokens.append(token)
             if i < len(values):
                 filtered_values.append(values[i])
-        
+
         # Recalculate statistics from filtered data
         if not filtered_values:
             # All tokens were filtered out, set default values
@@ -1613,16 +1710,16 @@ def get_activation_from_neuronpedia_api(
     """
     Get activation value for custom text using Neuronpedia API.
     Convenience wrapper that returns only the maxValue.
-    
+
     Args:
         model_id: Model ID (e.g., "gpt2-small", "gemma-2-2b")
         source: SAE ID/source (e.g., "9-res-jb", "6-gemmascope-mlp-16k")
         feature_index: Feature index
         custom_text: Custom text to get activation for
-    
+
     Returns:
         Maximum activation value (can be 0.0 if feature doesn't activate)
-    
+
     Raises:
         requests.exceptions.RequestException: If API call fails
         ValueError: If API returns invalid response
@@ -1713,7 +1810,7 @@ def evaluate_prediction_ability(
         feature_description = f"\nLabels:\n{labels_text}"
     else:
         feature_description = explanation.get('description', '')
-    
+
     if not feature_description:
         print(f"   ⚠️  No feature description found. Cannot use logprobs prediction.")
         return {
@@ -1758,7 +1855,7 @@ def evaluate_prediction_ability(
                 tokens=tokens,
                 show_details=False
             )
-            
+
             # Accumulate token usage and cost
             total_token_usage['prompt_tokens'] += token_usage['prompt_tokens']
             total_token_usage['completion_tokens'] += token_usage['completion_tokens']
@@ -1887,7 +1984,7 @@ def evaluate_prediction_ability(
             'method': 'logprobs_token_level',
             'token_usage': total_token_usage  # Add token usage to result
         }
-        
+
         # Calculate total cost for GPT-4o (if not already calculated)
         # Prices: Input $1.25/1M, Output $5.00/1M
         if total_token_usage.get('cost_total', 0.0) == 0.0 and total_token_usage['total_tokens'] > 0:
@@ -1902,7 +1999,7 @@ def evaluate_prediction_ability(
             total_cost = total_token_usage.get('cost_total', 0.0)
             total_cost_input = total_token_usage.get('cost_input', 0.0)
             total_cost_output = total_token_usage.get('cost_output', 0.0)
-        
+
         # Print token usage
         print(f"\n   📊 Token usage (GPT-4o for logprobs): {total_token_usage['prompt_tokens']} prompt + {total_token_usage['completion_tokens']} completion = {total_token_usage['total_tokens']} total")
         print(f"   💰 Cost: ${total_cost:.6f} (input: ${total_cost_input:.6f}, output: ${total_cost_output:.6f})")
@@ -2015,13 +2112,13 @@ def compare_results(
         neuro_corr = neuronpedia_pred_eval.get('correlation')
         sage_p = sage_pred_eval.get('p_value')
         neuro_p = neuronpedia_pred_eval.get('p_value')
-        
+
         # Handle NaN/None values
         sage_corr_display = f"{sage_corr:.4f}" if sage_corr is not None and not (isinstance(sage_corr, float) and np.isnan(sage_corr)) else "NaN"
         neuro_corr_display = f"{neuro_corr:.4f}" if neuro_corr is not None and not (isinstance(neuro_corr, float) and np.isnan(neuro_corr)) else "NaN"
         sage_p_display = f"{sage_p:.4f}" if sage_p is not None and not (isinstance(sage_p, float) and np.isnan(sage_p)) else "NaN"
         neuro_p_display = f"{neuro_p:.4f}" if neuro_p is not None and not (isinstance(neuro_p, float) and np.isnan(neuro_p)) else "NaN"
-        
+
         # Calculate difference only if both are valid
         if (sage_corr is not None and not (isinstance(sage_corr, float) and np.isnan(sage_corr)) and
             neuro_corr is not None and not (isinstance(neuro_corr, float) and np.isnan(neuro_corr))):
@@ -2032,7 +2129,7 @@ def compare_results(
 
         print(f"{'Pearson Correlation':.<40} {sage_corr_display:>15} {neuro_corr_display:>15} {corr_diff_display:>15}")
         print(f"{'P-value':.<40} {sage_p_display:>15} {neuro_p_display:>15} {'':>15}")
-        
+
         # Add interpretation notes
         if sage_corr is not None and neuro_corr is not None:
             if not (isinstance(sage_corr, float) and np.isnan(sage_corr)) and not (isinstance(neuro_corr, float) and np.isnan(neuro_corr)):
@@ -2052,12 +2149,12 @@ def compare_results(
 
         for i, (sage_ex, neuro_ex) in enumerate(zip(sage_example_results, neuro_example_results), 1):
             text = sage_ex['text'][:45] + "..." if len(sage_ex['text']) > 45 else sage_ex['text']
-            
+
             # Calculate average predicted and actual values for this example
             sage_pred_avg = sum(sage_ex['predicted_values']) / len(sage_ex['predicted_values']) if sage_ex['predicted_values'] else 0.0
             neuro_pred_avg = sum(neuro_ex['predicted_values']) / len(neuro_ex['predicted_values']) if neuro_ex['predicted_values'] else 0.0
             actual_avg = sum(sage_ex['actual_values']) / len(sage_ex['actual_values']) if sage_ex['actual_values'] else 0.0
-            
+
             sage_err = abs(sage_pred_avg - actual_avg)
             neuro_err = abs(neuro_pred_avg - actual_avg)
 
@@ -2092,7 +2189,7 @@ def process_single_feature(
 ) -> Dict[str, Any]:
     """
     Process a single feature comparison.
-    
+
     Note: All activation evaluations now use Neuronpedia API instead of local system.
     The model_name, sae_path, and device parameters are kept for backward compatibility
     and record-keeping only, but are NOT used for any activation calculations.
@@ -2132,7 +2229,7 @@ def process_single_feature(
     prediction_examples_texts = []  # Selected texts for Prediction Evaluation
     prediction_examples_activations = []  # Activation values for selected texts
     global_max_activation = None  # Global max activation from all exemplars (for normalization)
-    
+
     try:
         # Get all exemplars from API (not just top 10)
         all_api_exemplars = get_activation_exemplars_from_api(
@@ -2141,21 +2238,21 @@ def process_single_feature(
             feature_index=feature_index,
             return_all=True  # Get all exemplars
         )
-        
+
         if all_api_exemplars and len(all_api_exemplars) > 0:
             # Get top 10 high-activating exemplars for Generation Evaluation and threshold calculation
             high_exemplars = all_api_exemplars[:min(10, len(all_api_exemplars))]
-            
+
             # Calculate global max activation from all exemplars (for normalization baseline)
             # Since exemplars are sorted by activation descending, the first one has the max
             global_max_activation = all_api_exemplars[0].get('activation', 0.0) if all_api_exemplars else None
-            
+
             print(f"   ✅ Retrieved {len(all_api_exemplars)} exemplars from API")
             print(f"      Top 10 high-activating exemplars (for Generation Evaluation): {len(high_exemplars)} exemplars")
             print(f"      Remaining exemplars (for Prediction Evaluation): {len(all_api_exemplars) - len(high_exemplars)} exemplars")
             if global_max_activation is not None:
                 print(f"      Global max activation (for normalization): {global_max_activation:.4f}")
-            
+
             # Calculate average of max activations from top 10 exemplars for threshold
             if high_exemplars and len(high_exemplars) > 0:
                 max_activations = [exemplar.get('activation', 0.0) for exemplar in high_exemplars]
@@ -2170,7 +2267,7 @@ def process_single_feature(
                     print(f"   ⚠️  No activation values found in high exemplars, using original threshold: {activation_threshold:.4f}")
             else:
                 print(f"   ⚠️  No high-activating exemplars found, using original threshold: {activation_threshold:.4f}")
-            
+
             # Select exemplars for Prediction Evaluation (excluding top 10)
             # From remaining exemplars, select: 4 high, 3 medium, 3 low
             print(f"\n   📋 Selecting exemplars for Prediction Evaluation (excluding top 10):")
@@ -2181,7 +2278,7 @@ def process_single_feature(
                 num_medium=3,  # Select 3 medium-activating exemplars
                 num_low=3  # Select 3 low-activating exemplars
             )
-            
+
             # Print top 10 high-activating exemplars (for Generation Evaluation)
             print(f"\n   📋 Top 10 High-Activating Exemplars (for Generation Evaluation, variable: high_exemplars):")
             print("   " + "="*76)
@@ -2193,7 +2290,7 @@ def process_single_feature(
                     buffer_tokens = exemplar.get('tokens', [])
                     buffer_values = exemplar.get('values', [])
                     buffer_max_idx = exemplar.get('max_token_index', 0)
-                    
+
                     print(f"   {i}. text: {buffer_text}")
                     if buffer_tokens and buffer_values and len(buffer_tokens) == len(buffer_values):
                         token_parts = []
@@ -2209,7 +2306,7 @@ def process_single_feature(
             else:
                 print("   (No high-activating exemplars)")
             print("   " + "="*76)
-            
+
             # Print summary of variable assignments
             print(f"\n   📊 Variable Assignment Summary:")
             print(f"      - high_exemplars: {len(high_exemplars)} exemplars (top 10 highest activation, for Generation Evaluation)")
@@ -2241,10 +2338,10 @@ def process_single_feature(
     # Check if explanation file exists locally
     explanation_file = os.path.join(output_dir, f'feature_{feature_index}_neuronpedia_explanation.json')
     explanation_file_exists = os.path.exists(explanation_file)
-    
+
     # If explanation doesn't exist locally, we'll delete and regenerate if it exists on API
     force_regenerate = not explanation_file_exists
-    
+
     neuronpedia_result = call_neuronpedia_api(
         model_id=neuronpedia_model_id,
         layer=layer,
@@ -2273,7 +2370,7 @@ def process_single_feature(
     try:
         # Initialize token usage tracking
         total_token_usage_gpt5 = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'cost_input': 0.0, 'cost_output': 0.0, 'cost_total': 0.0}
-        
+
         # Generate examples from SAGE
         print("\n" + "="*80)
         print("STEP 3: Generate Examples from SAGE Explanation")
@@ -2310,7 +2407,7 @@ def process_single_feature(
         print("="*80)
         print(f"   Using activation threshold: {dynamic_activation_threshold:.4f} (calculated from API exemplars)")
         sage_evaluation = evaluate_examples(
-            sage_examples, 
+            sage_examples,
             system=None,
             activation_threshold=dynamic_activation_threshold,
             use_api=True,
@@ -2325,7 +2422,7 @@ def process_single_feature(
         print("="*80)
         print(f"   Using activation threshold: {dynamic_activation_threshold:.4f} (calculated from API exemplars)")
         neuronpedia_evaluation = evaluate_examples(
-            neuronpedia_examples, 
+            neuronpedia_examples,
             system=None,
             activation_threshold=dynamic_activation_threshold,
             use_api=True,
@@ -2339,7 +2436,7 @@ def process_single_feature(
         print("\n" + "="*80)
         print("STEP 7: Select Exemplars for Prediction Evaluation (from API, excluding top 10)")
         print("="*80)
-        
+
         # Check if we have selected exemplars from STEP 0
         if prediction_examples_texts and prediction_examples_activations and len(prediction_examples_texts) >= 10:
             print(f"   ✅ Using selected exemplars from STEP 0:")
@@ -2366,7 +2463,7 @@ def process_single_feature(
                         feature_index=feature_index,
                         return_all=True
                     )
-                    
+
                     if all_exemplars_fallback and len(all_exemplars_fallback) > 10:
                         prediction_examples_texts, prediction_examples_activations = select_exemplars_for_prediction_evaluation(
                             all_exemplars_fallback,
@@ -2386,7 +2483,7 @@ def process_single_feature(
                 traceback.print_exc()
                 prediction_examples_texts = []
                 prediction_examples_activations = []
-        
+
         if prediction_examples_texts and len(prediction_examples_texts) >= 10 and len(prediction_examples_activations) == len(prediction_examples_texts):
             # Prediction evaluation for SAGE (using logprobs-based method, requires API for token-level activations)
             print("\n" + "="*80)
@@ -2395,10 +2492,10 @@ def process_single_feature(
             if global_max_activation is not None:
                 print(f"   Using global max activation ({global_max_activation:.4f}) as normalization baseline for all samples")
             sage_prediction_eval = evaluate_prediction_ability(
-                sage_conclusion, 
+                sage_conclusion,
                 prediction_examples_texts,  # Use selected exemplars from API
                 activations=None,  # Not used in logprobs-based method, will get from API
-                source="SAGE", 
+                source="SAGE",
                 llm_model=llm_model,
                 use_api=True,  # Required for logprobs-based prediction to get token-level activations
                 model_id=neuronpedia_model_id,
@@ -2414,10 +2511,10 @@ def process_single_feature(
             if global_max_activation is not None:
                 print(f"   Using global max activation ({global_max_activation:.4f}) as normalization baseline for all samples")
             neuronpedia_prediction_eval = evaluate_prediction_ability(
-                neuronpedia_explanation, 
+                neuronpedia_explanation,
                 prediction_examples_texts,  # Use selected exemplars from API
                 activations=None,  # Not used in logprobs-based method, will get from API
-                source="Neuronpedia", 
+                source="Neuronpedia",
                 llm_model=llm_model,
                 use_api=True,  # Required for logprobs-based prediction to get token-level activations
                 model_id=neuronpedia_model_id,
@@ -2425,11 +2522,11 @@ def process_single_feature(
                 feature_index=feature_index,
                 global_max_activation=global_max_activation  # Use global max activation for normalization
             )
-            
+
             # Accumulate token usage from prediction evaluations (GPT-4o for logprobs)
             sage_pred_token_usage = sage_prediction_eval.get('token_usage', {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'cost_input': 0.0, 'cost_output': 0.0, 'cost_total': 0.0})
             neuro_pred_token_usage = neuronpedia_prediction_eval.get('token_usage', {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'cost_input': 0.0, 'cost_output': 0.0, 'cost_total': 0.0})
-            
+
             total_token_usage_gpt4o = {
                 'prompt_tokens': sage_pred_token_usage.get('prompt_tokens', 0) + neuro_pred_token_usage.get('prompt_tokens', 0),
                 'completion_tokens': sage_pred_token_usage.get('completion_tokens', 0) + neuro_pred_token_usage.get('completion_tokens', 0),
@@ -2468,7 +2565,7 @@ def process_single_feature(
             sage_evaluation, neuronpedia_evaluation,
             sage_prediction_eval, neuronpedia_prediction_eval
         )
-        
+
         # Print total token usage and cost summary
         print("\n" + "="*80)
         print("📊 TOKEN USAGE & COST SUMMARY")
@@ -2609,7 +2706,7 @@ def process_single_feature(
             import traceback
             traceback.print_exc()
             raise RuntimeError(error_msg) from e
-        
+
         # Export Neuronpedia explanation separately for easy access
         explanation_file = os.path.join(output_dir, f'feature_{feature_index}_neuronpedia_explanation.json')
         explanation_export_data = {
@@ -2625,16 +2722,16 @@ def process_single_feature(
             'formatted_explanation': neuronpedia_explanation,  # The formatted version used in evaluation
             'exported_at': datetime.now().isoformat()
         }
-        
+
         # Add warning if fallback was used
         if neuronpedia_result.get('warning'):
             explanation_export_data['warning'] = neuronpedia_result.get('warning')
-        
+
         # Export explanation - raise exception on failure
         try:
             with open(explanation_file, 'w', encoding='utf-8') as f:
                 json.dump(explanation_export_data, f, indent=2, ensure_ascii=False)
-            
+
             source_msg = neuronpedia_result.get('source', 'unknown')
             if source_msg == 'existing':
                 print(f"   ✅ Neuronpedia explanation (existing) exported to: {explanation_file}")
@@ -2750,11 +2847,11 @@ def main():
     print("="*80)
     print("🔬 SAGE vs Neuronpedia Comparison Evaluation")
     print("="*80)
-    
+
     # Use neuronpedia_model_id as model_name if model_name is not provided
     if args.model_name is None:
         args.model_name = args.neuronpedia_model_id
-    
+
     print(f"\nConfiguration (for record-keeping only):")
     print(f"  Model: {args.model_name}")
     if args.sae_path:
