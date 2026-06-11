@@ -216,7 +216,7 @@ def ask_agent(model: str, history: List[Dict[str, Any]]) -> str:
                 return response.content[0].text
 
             # Handle OpenAI models
-            elif model in ['gpt-5-nano', 'gpt-5-mini', 'gpt-5', 'gpt-4o-new', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4'] and OPENAI_AVAILABLE:
+            elif model in ['gpt-5.2', 'gpt-5.5', 'gpt-5-nano', 'gpt-5-mini', 'gpt-5', 'gpt-4o-new', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4'] and OPENAI_AVAILABLE:
                 if model == 'gpt-4o-new':
                     model = 'gpt-4o-2024-11-20'
 
@@ -374,7 +374,9 @@ def ask_agent(model: str, history: List[Dict[str, Any]]) -> str:
                 print(f'❌ Error type: {type(e).__name__}')
                 print(f'❌ OPENAI_AVAILABLE: {OPENAI_AVAILABLE}')
                 print(f"❌ BASE_URL: {os.getenv('OPENAI_BASE_URL')}")
-                print(f"❌ OPENAI_API_KEY: {os.getenv('OPENAI_API_KEY') if os.getenv('OPENAI_API_KEY') else 'not set'}")
+                api_key = os.getenv('OPENAI_API_KEY')
+                masked_key = f"{api_key[:7]}...{api_key[-4:]}" if api_key and len(api_key) > 12 else "not set"
+                print(f"❌ OPENAI_API_KEY: {masked_key}")
 
                 raise RuntimeError(f"OpenAI API error: {str(e)}")
 
@@ -443,24 +445,29 @@ def validate_agent_response(response: str) -> bool:
     if len(response.strip()) < 10:
         return False
 
-    # Check for common error patterns
-    error_patterns = [
-        "error",
-        "failed",
-        "timeout",
-        "quota exceeded",
-        "rate limit",
-        "unavailable"
-    ]
-
+    # Substring matches on words like "failed" / "error" rejected analytical
+    # reasoning (e.g. "the test failed", "the hypothesis failed to confirm").
+    # Match only standalone API-error sentinels that LLMs use when they
+    # surface a transport/quota error verbatim in their reply.
     response_lower = response.lower()
-    for pattern in error_patterns:
-        if pattern in response_lower:
+    api_error_sentinels = [
+        "i encountered an error",
+        "an error occurred",
+        "request failed",
+        "request timed out",
+        "rate limit exceeded",
+        "quota exceeded",
+        "service unavailable",
+        "internal server error",
+        "503 service unavailable",
+        "429 too many requests",
+    ]
+    for sentinel in api_error_sentinels:
+        if sentinel in response_lower:
             return False
 
     return True
 
 
 __all__ = ["AgentConfig", "SAGEAgent", "ask_agent"]
-
 

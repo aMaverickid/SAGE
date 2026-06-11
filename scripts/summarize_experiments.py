@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Optional
+
+UPDATE_STATUSES = ("CONFIRMED", "REFUTED", "REFINED", "UNCHANGED")
 
 
 def iter_result_files(root: Path) -> Iterable[Path]:
@@ -50,6 +53,8 @@ def summarize_result(path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
     tests = data.get("test_results", [])
     hypotheses = data.get("hypotheses", [])
     agent_actions = data.get("agent_actions", [])
+    num_tests = count_tests(data)
+    update_stats = summarize_update_texts(data)
     activations = [float(test.get("activation", 0.0)) for test in tests]
     statuses = defaultdict(int)
     for hypothesis in hypotheses:
@@ -64,7 +69,8 @@ def summarize_result(path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
         "total_rounds": data.get("total_rounds", 0),
         "duration_seconds": data.get("duration_seconds", 0.0),
         "num_hypotheses": len(hypotheses),
-        "num_tests": len(tests),
+        "num_tests": num_tests,
+        **update_stats,
         "max_activation": max(activations) if activations else 0.0,
         "mean_test_activation": mean(activations) if activations else 0.0,
         "confirmed_hypotheses": statuses["CONFIRMED"],
@@ -87,25 +93,150 @@ def aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     summary = []
     for variant, group in sorted(by_variant.items()):
-        successful = [row for row in group if row["has_description"]]
-        failure_counts = defaultdict(int)
-        for row in group:
-            failure_counts[row["failure_mode"]] += 1
-        summary.append({
-            "variant": variant,
-            "features": len(group),
-            "with_description": len(successful),
-            "avg_rounds": mean(row["total_rounds"] for row in group),
-            "avg_tests": mean(row["num_tests"] for row in group),
-            "avg_confirmed_hypotheses": mean(row["confirmed_hypotheses"] for row in group),
-            "avg_max_activation": mean(row["max_activation"] for row in group),
-            "std_max_activation": pstdev(row["max_activation"] for row in group) if len(group) > 1 else 0.0,
-            "avg_tokens": mean(row["total_tokens"] for row in group),
-            "avg_cost_usd": mean(row["cost_usd"] for row in group),
-            "avg_duration_seconds": mean(row["duration_seconds"] for row in group),
-            "failure_modes": dict(sorted(failure_counts.items())),
-        })
+        summary.append(aggregate_group(group, variant=variant))
     return summary
+
+
+def aggregate_by_variant_layer(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_variant_layer: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_variant_layer[(row["variant"], row.get("layer", "unknown"))].append(row)
+
+    summary = []
+    for (variant, layer), group in sorted(
+        by_variant_layer.items(),
+        key=lambda item: (str(item[0][0]), layer_sort_key(item[0][1])),
+    ):
+        summary.append(aggregate_group(group, variant=variant, layer=layer))
+    return summary
+
+
+def aggregate_group(
+    group: List[Dict[str, Any]],
+    variant: str,
+    layer: Any = None,
+) -> Dict[str, Any]:
+    successful = [row for row in group if row["has_description"]]
+    failure_counts = defaultdict(int)
+    for row in group:
+        failure_counts[row["failure_mode"]] += 1
+
+    out = {
+        "variant": variant,
+        "features": len(group),
+        "with_description": len(successful),
+        "avg_rounds": mean(row["total_rounds"] for row in group),
+        "avg_tests": mean(row["num_tests"] for row in group),
+        "avg_update_text_count": mean(row["update_text_count"] for row in group),
+        "avg_update_decision_count": mean(row["update_decision_count"] for row in group),
+        "avg_update_confirmed_count": mean(row["update_confirmed_count"] for row in group),
+        "avg_update_refuted_count": mean(row["update_refuted_count"] for row in group),
+        "avg_update_refined_count": mean(row["update_refined_count"] for row in group),
+        "avg_update_unchanged_count": mean(row["update_unchanged_count"] for row in group),
+        "avg_confirmed_hypotheses": mean(row["confirmed_hypotheses"] for row in group),
+        "avg_max_activation": mean(row["max_activation"] for row in group),
+        "std_max_activation": (
+            pstdev(row["max_activation"] for row in group) if len(group) > 1 else 0.0
+        ),
+        "avg_tokens": mean(row["total_tokens"] for row in group),
+        "avg_cost_usd": mean(row["cost_usd"] for row in group),
+        "avg_duration_seconds": mean(row["duration_seconds"] for row in group),
+        "failure_modes": dict(sorted(failure_counts.items())),
+    }
+    if layer is not None:
+        out = {"variant": variant, "layer": layer, **{k: v for k, v in out.items() if k != "variant"}}
+    return out
+
+
+def layer_sort_key(layer: Any) -> tuple:
+    try:
+        return (0, int(layer))
+    except (TypeError, ValueError):
+        return (1, str(layer))
+
+
+def count_tests(data: Dict[str, Any]) -> int:
+    """Count tests across current and older result schemas."""
+    trace = data.get("experiment_trace") or {}
+    trace_hypotheses = trace.get("hypotheses", []) or []
+    candidates = [
+        len(data.get("test_results", []) or []),
+        len(trace.get("designed_tests", []) or []),
+        len(trace.get("activation_results", []) or []),
+    ]
+    hyp_test_count = sum(len(hyp.get("tests", []) or []) for hyp in trace_hypotheses)
+    if hyp_test_count:
+        candidates.append(hyp_test_count)
+    return max(candidates)
+
+
+def summarize_update_texts(data: Dict[str, Any]) -> Dict[str, int]:
+    texts = update_texts(data)
+    counts = {status.lower(): 0 for status in UPDATE_STATUSES}
+    decision_count = 0
+    for text in texts:
+        statuses = extract_update_statuses(text)
+        decision_count += len(statuses)
+        for status in statuses:
+            counts[status.lower()] += 1
+    return {
+        "update_text_count": len(texts),
+        "update_decision_count": decision_count,
+        "update_confirmed_count": counts["confirmed"],
+        "update_refuted_count": counts["refuted"],
+        "update_refined_count": counts["refined"],
+        "update_unchanged_count": counts["unchanged"],
+    }
+
+
+def update_texts(data: Dict[str, Any]) -> List[str]:
+    trace = data.get("experiment_trace") or {}
+    texts = []
+    for hyp in trace.get("hypotheses", []) or []:
+        texts.extend(hyp.get("refinement_decisions", []) or [])
+    if texts:
+        return [str(text) for text in texts if is_update_text(text)]
+    return [
+        str(item)
+        for item in data.get("analysis_history", []) or []
+        if is_update_text(item)
+    ]
+
+
+def is_update_text(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    return (
+        "HYPOTHESIS UPDATES:" in text
+        or "UPDATED HYPOTHESIS STATUS:" in text
+    )
+
+
+def extract_update_statuses(text: str) -> List[str]:
+    status_group = "|".join(UPDATE_STATUSES)
+    flags = re.IGNORECASE
+    statuses = []
+    for line in text.splitlines():
+        match = re.search(rf"\bH\d+\s*\(\s*({status_group})\s*\)", line, flags)
+        if not match:
+            match = re.search(
+                rf"\bH\d+\s*\([^)]*STATUS[^)]*\)\s*:?\s*({status_group})\b",
+                line,
+                flags,
+            )
+        if match:
+            statuses.append(match.group(1).upper())
+    if statuses:
+        return statuses
+
+    for pattern in (
+        rf"\bHypothesis:\s*({status_group})\b",
+        rf"\bCurrent Status:\s*({status_group})\b",
+    ):
+        match = re.search(pattern, text, flags)
+        if match:
+            return [match.group(1).upper()]
+    return []
 
 
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
@@ -137,9 +268,15 @@ def main() -> None:
             rows.append(summarize_result(path, data))
 
     variant_summary = aggregate(rows)
+    variant_layer_summary = aggregate_by_variant_layer(rows)
     (output_dir / "experiment_rows.json").write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
     (output_dir / "variant_summary.json").write_text(json.dumps(variant_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    (output_dir / "variant_layer_summary.json").write_text(
+        json.dumps(variant_layer_summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     write_csv(output_dir / "variant_summary.csv", variant_summary)
+    write_csv(output_dir / "variant_layer_summary.csv", variant_layer_summary)
 
     print(f"Found {len(rows)} structured result files under {root}")
     print(f"Wrote summaries to {output_dir}")

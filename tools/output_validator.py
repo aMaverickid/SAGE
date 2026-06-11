@@ -358,7 +358,11 @@ class OutputValidator:
         design = {}
         
         # Extract测试的假设
-        hypothesis_match = re.search(r"TESTING HYPOTHESIS:\s*(.+?)(?=TEST DESIGN|$)", output, re.DOTALL)
+        hypothesis_match = re.search(
+            r"TESTING HYPOTHESIS:\s*(.+?)(?=\[TOOL\]|EXPECTED:|$)",
+            output,
+            re.DOTALL,
+        )
         if hypothesis_match:
             design["hypothesis"] = hypothesis_match.group(1).strip()
         
@@ -380,7 +384,11 @@ class OutputValidator:
                 design["prompt"] = prompt_match2.group(1)
         
         # Extract期望结果
-        expected_match = re.search(r"Expected:\s*(.+?)(?=Validates|$)", output, re.DOTALL)
+        expected_match = re.search(
+            r"EXPECTED:\s*(.+?)(?=\n[A-Z][A-Z _-]*:|\n\[|$)",
+            output,
+            re.DOTALL | re.IGNORECASE,
+        )
         if expected_match:
             design["expected"] = expected_match.group(1).strip()
         

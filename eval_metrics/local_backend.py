@@ -28,14 +28,37 @@ def _require_torch():
     return torch
 
 
-def _set_feature_act_hook(act, _hook, feature: int, value: float):
+def _sae_hook_name(sae) -> str:
+    """Return the SAE's residual hook name across sae-lens versions.
+
+    Older sae-lens (≤5.x) exposed ``sae.cfg.hook_name`` directly. sae-lens
+    6.x moved it under ``sae.cfg.metadata.hook_name`` (SAEMetadata). We
+    try the legacy path first, then fall back to the metadata namespace.
+    """
+    direct = getattr(sae.cfg, "hook_name", None)
+    if direct is not None:
+        return str(direct)
+    metadata = getattr(sae.cfg, "metadata", None)
+    if metadata is not None:
+        name = getattr(metadata, "hook_name", None)
+        if name is not None:
+            return str(name)
+    raise AttributeError(
+        "SAE config exposes no hook_name (checked sae.cfg.hook_name and "
+        "sae.cfg.metadata.hook_name); is this an unsupported sae-lens version?"
+    )
+
+
+def _set_feature_act_hook(act, hook, feature: int, value: float):  # noqa: ARG001
     """Clamp the SAE feature dim to ``value`` in-place (KL-measurement hook).
 
-    ``_hook`` is the HookPoint passed by TransformerLens; we don't use it."""
+    ``hook`` is the HookPoint TransformerLens passes by keyword — the
+    parameter name MUST be ``hook`` (TL calls it as ``fn(act, hook=...)``);
+    we just don't use it."""
     act[:, :, feature] = value
 
 
-def _gen_hook(clean_act, _hook, sae, feature: int, value: float):
+def _gen_hook(clean_act, hook, sae, feature: int, value: float):  # noqa: ARG001
     """Steering hook used during generation: re-encode through the SAE,
     clamp the chosen feature, then decode back into the residual stream
     while preserving the SAE reconstruction error."""
@@ -90,7 +113,7 @@ def _kl_hooks(sae, layer: int, feature: int, value: float):
     if sae is None:
         hook = f"blocks.{layer}.mlp.hook_pre"
     else:
-        hook = f"{sae.cfg.hook_name}.hook_sae_acts_post"
+        hook = f"{_sae_hook_name(sae)}.hook_sae_acts_post"
     return [(hook, functools.partial(_set_feature_act_hook, feature=feature, value=value))]
 
 
@@ -128,7 +151,7 @@ def hooked_gen(
     ``prompt`` may be a string, list of strings, or pre-tokenised tensor;
     the model's ``to_tokens`` is responsible for normalising it."""
     model.reset_hooks()
-    hook_name = f"blocks.{layer}.mlp.hook_pre" if sae is None else sae.cfg.hook_name
+    hook_name = f"blocks.{layer}.mlp.hook_pre" if sae is None else _sae_hook_name(sae)
     model.add_hook(
         hook_name,
         functools.partial(_gen_hook, sae=sae, feature=feature, value=value),
@@ -175,7 +198,7 @@ def get_pos_neg_acts(
         pos_cache = model.run_with_cache_with_saes(pos, saes=[sae], return_type=None)[1]
         neg_cache = model.run_with_cache_with_saes(neg, saes=[sae], return_type=None)[1]
         relu = "pre" if pre_relu else "post"
-        block = f"{sae.cfg.hook_name}.hook_sae_acts_{relu}"
+        block = f"{_sae_hook_name(sae)}.hook_sae_acts_{relu}"
 
     pos_acts = pos_cache[block][:, :, feature]
     neg_acts = neg_cache[block][:, :, feature]

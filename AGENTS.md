@@ -1,125 +1,47 @@
-# AGENTS.md
+# Repository Guidelines
 
-This file provides guidance to coding agents when working with code in this repository.
+## Project Structure & Module Organization
 
-## Project Overview
+SAGE is a Python 3.11 project for SAE feature interpretation. Core workflow code lives in `core/`: `controller.py` orchestrates runs, `state_machine.py` tracks analysis states, and `agent.py` handles LLM calls. Tooling and integrations are in `tools/`, including Neuronpedia access, prompt generation, validation, token tracking, and corpus utilities. `environment/` wraps tool calls for the controller. Experiment variants are defined in `experiment_variants.py`. Batch and evaluation entry points are in `scripts/`; reusable metric code is in `eval_metrics/`. Manifests belong in `experiment_manifests/`, documentation in `docs/`, and generated outputs in `results/`, `analysis*/`, `cache/`, or `output/`.
 
-SAGE (SAE Automated Generation of Explanations) is an automated interpretability system for analyzing Sparse Autoencoder (SAE) features using agentic LLM workflows. It generates natural language explanations for SAE features through iterative hypothesis testing and refinement.
+## Build, Test, and Development Commands
 
-## Setup
+Install dependencies with:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-API keys go in `sage_config.env` (loaded automatically at startup):
-- `OPENAI_API_KEY` — required for GPT-based agents
-- `ANTHROPIC_API_KEY` — optional, for Claude agents
-- `GOOGLE_API_KEY` — optional, for Gemini agents
-- `NEURONPEDIA_API_KEY` — required for API mode
-
-## Running
-
-**API mode (recommended, no model loading):**
-```bash
-python main.py \
-  --agent_llm gpt-5 \
-  --target_llm google/gemma-2-2b \
-  --features "layer0=0" \
-  --use_api_for_activations true \
-  --neuronpedia_model_id gemma-2-2b \
-  --neuronpedia_source 0-gemmascope-mlp-16k \
-  --max_rounds 14 \
-  --top_k 10
-```
-
-**Local mode (requires GPU/CPU model loading):**
-```bash
-python main.py \
-  --agent_llm gpt-5 \
-  --target_llm google/gemma-2-2b \
-  --sae_path "sae-lens://release=gemma-scope-2b-pt-res-canonical;sae_id=layer_0/width_16k/canonical" \
-  --features "layer0=0" \
-  --use_api_for_activations false \
-  --device cuda
-```
-
-**Evaluation:**
-```bash
-python scripts/evaluate.py \
-  --sage_results_path ./results/full/gpt-5/google_gemma-2-2b/layer_0/feature_0/structured_results.json \
-  --feature_index 0 \
-  --layer 0-gemmascope-mlp-16k \
-  --neuronpedia_model_id gemma-2-2b \
-  --llm_model gpt-5
-```
-
-Results skip features where `description.txt` already exists — delete the feature folder to re-run.
-
-## Diagnostic Variants & Manifest Workflow
-
-`experiment_variants.py` defines 8 ablations (`full`, `single_pass`, `no_active_testing`, `no_refinement`, `single_hypothesis`, `no_negative_control`, `random_test`, `output_aware`). The chosen variant flips flags consumed by `prompt_generator.py` / `state_machine.py` (active testing, refinement, negative-control prompts, etc.) and becomes the first path segment under `results/`.
-
-Reproducible multi-feature experiments use a 3-step pipeline:
+Run an API-backed feature analysis:
 
 ```bash
-# 1. Sample a deterministic feature set into a manifest JSON
-python scripts/feature_protocol.py --models gemma-2-2b --layers 0 \
-  --features_per_layer 50 --seed 0 --output experiment_manifests/pilot.json
-
-# 2. Run all (or selected) variants over the manifest
-python scripts/run_manifest.py --manifest_path experiment_manifests/pilot.json \
-  --variants full,single_pass,no_active_testing
-
-# 3. Aggregate structured_results.json across runs into CSV/JSON tables
-python scripts/summarize_experiments.py --results_root results --output_dir analysis
+python main.py --agent_llm gpt-5 --target_llm google/gemma-2-2b \
+  --features "layer0=0" --use_api_for_activations true \
+  --neuronpedia_model_id gemma-2-2b --neuronpedia_source 0-gemmascope-mlp-16k
 ```
 
-`main.py` also accepts `--manifest_path` directly (overrides `--features`), plus `--experiment_variant`, `--random_seed`, and `--save_trace` (writes `experiment_trace.json`).
+Run manifest experiments with `python scripts/run_manifest.py --manifest_path experiment_manifests/pilot.json --variants full,single_pass`, then aggregate with `python scripts/summarize_experiments.py --results_root results --output_dir analysis`.
 
-## Architecture
+## Coding Style & Naming Conventions
 
-SAGE uses a 3-layer architecture orchestrated by `SAGEController` (`core/controller.py`):
+Use PEP 8 Python style with 4-space indentation. Prefer `snake_case` for functions, variables, and modules; `PascalCase` for classes and dataclasses. Keep files under 400 lines and functions under 40 lines where practical. Add Google-style module and public API docstrings, and comment only non-obvious logic. Reuse existing controller, state-machine, and tool abstractions instead of adding parallel frameworks.
 
-**Layer 1 — State Machine** (`core/state_machine.py`): Hard-coded workflow control. States flow: `INIT → GET_EXEMPLARS → ANALYZE_EXEMPLARS → PARALLEL_HYPOTHESIS_TESTING → [DESIGN_TEST → RUN_TEST → ANALYZE_RESULT → UPDATE_HYPOTHESIS] × N → REVIEW_ALL_HYPOTHESES → FINAL_CONCLUSION → DONE`. Enforces valid transitions and tracks hypotheses/test results.
+## Testing Guidelines
 
-**Layer 2 — Prompt Generator** (`tools/prompt_generator.py`): Generates the LLM prompt for the current state by inspecting `SAGEStateMachine` state. No LLM calls here — pure code logic.
+There is no central pytest suite yet; use focused smoke scripts and module self-tests. Useful checks include:
 
-**Layer 3 — LLM Agent** (`core/agent.py`): `ask_agent()` dispatches to OpenAI/Anthropic/Google APIs. Supports all major provider SDKs with retry logic.
-
-**Support components:**
-- `core/system.py` — wraps the target model + SAE (TransformerLens + SAELens); skipped entirely in API mode
-- `tools/base.py` — `Tools` class: logging, dataset access, delegates activation queries to `CorpusManager` or `NeuronpediaManager`
-- `tools/neuronpedia.py` — Neuronpedia API client for fetching exemplars and activation traces
-- `tools/corpus.py` — local corpus management for activation computation
-- `tools/output_validator.py` — validates and parses LLM outputs per state
-- `tools/token_tracker.py` — tracks API token usage across the run
-- `environment/experiment.py` — `ExperimentEnvironment` wraps `Tools` and provides the tool-call interface to the controller
-- `scripts/evaluate.py` / `tools/evaluate.py` — evaluation pipeline comparing SAGE vs Neuronpedia baselines
-
-## Key Data Structures
-
-- `Hypothesis` — id, text, status (`PENDING/CONFIRMED/REFUTED/REFINED`), confidence, test history
-- `TestResult` — prompt, expected, actual_activation, normalized_activation, result
-- `Exemplar` — text, activation, tokens, per_token_activations
-
-## Output Structure
-
-```
-results/{variant}/{agent_llm}/{target_llm}/layer_{X}/feature_{Y}/
-  structured_results.json   # full results (incl. variant_config, feature_spec, token_usage)
-  experiment_trace.json     # compact audit trace (when --save_trace true)
-  description.txt           # final feature description
-  evidence.txt
-  labels.txt
-  token_usage.json
-  log.json
+```bash
+python scripts/_smoke_output_metric.py
+python scripts/_smoke_check_new_variants.py
+python tools/output_validator.py
 ```
 
-`structured_results.json` is the single source of truth — `summarize_experiments.py` walks `results/**/structured_results.json` and infers the variant from the path when `experiment_variant` isn't embedded in the file.
+For new tests, prefer deterministic fixtures or small manifests. Name smoke scripts `scripts/_smoke_<area>.py` and keep API-dependent tests clearly documented.
 
-## Neuronpedia Source Format
+## Commit & Pull Request Guidelines
 
-- Gemma: `{layer}-gemmascope-mlp-16k`
-- GPT-2: `{layer}-res-jb`
-- Llama: `{layer}-resid-post-aa`
+Recent history uses short imperative messages such as `Add input/output eval metrics` and `Update README documentation`. Follow that style: state the user-visible change first, then add details in the body if needed. Pull requests should include the affected workflow, commands run, relevant manifest or feature IDs, and notes on output files or evaluation changes. Link issues when available.
+
+## Security & Configuration Tips
+
+Put API keys in `sage_config.env`; never commit secrets, generated results, caches, or analysis outputs. Prefer API mode for routine development to avoid local model downloads and GPU-specific failures.

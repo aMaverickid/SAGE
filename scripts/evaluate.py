@@ -174,7 +174,7 @@ Current token: {token}
 Please output only a number between 0-10, representing the activation value:"""
 
     base_url = os.getenv("DMX_API_BASE_URL", "https://www.dmxapi.cn/v1")
-    api_key = api_key or os.getenv("DMX_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("DMX_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
     if not api_key:
         raise ValueError(
             "Missing API key for activation logprob prediction. "

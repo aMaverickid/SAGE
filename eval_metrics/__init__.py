@@ -9,10 +9,24 @@ Public entry points:
     - ``output_metric.compute_output_score``
     - ``shared.discover_variant_features``
 """
-from .input_metric import InputScore, compute_input_score, generate_pos_neg_sentences
+from .input_metric import (
+    DEFAULT_ACTIVATION_THRESHOLD,
+    DEFAULT_MODERATE_THRESHOLD,
+    DEFAULT_N_EXAMPLES,
+    DEFAULT_PREDICTIVE_LLM_MODEL,
+    InputScore,
+    compute_input_score,
+    generate_test_examples,
+)
+from .input_predictive import (
+    compute_predictive_accuracy,
+    predictive_cache_path,
+)
 from .output_metric import OutputScore, compute_output_score, build_steered_set
 from .shared import (
+    DEFAULT_DESCRIPTION_FILENAME,
     DEFAULT_LABEL_FILENAME,
+    DEFAULT_TEXT_FILENAME,
     description_hash,
     discover_variant_features,
     load_description,
@@ -21,16 +35,24 @@ from .shared import (
 )
 
 __all__ = [
+    "DEFAULT_ACTIVATION_THRESHOLD",
+    "DEFAULT_DESCRIPTION_FILENAME",
     "DEFAULT_LABEL_FILENAME",
+    "DEFAULT_MODERATE_THRESHOLD",
+    "DEFAULT_N_EXAMPLES",
+    "DEFAULT_PREDICTIVE_LLM_MODEL",
+    "DEFAULT_TEXT_FILENAME",
     "InputScore",
     "OutputScore",
     "build_steered_set",
     "compute_input_score",
     "compute_output_score",
+    "compute_predictive_accuracy",
     "description_hash",
     "discover_variant_features",
-    "generate_pos_neg_sentences",
+    "generate_test_examples",
     "load_description",
     "load_feature_text",
     "load_labels",
+    "predictive_cache_path",
 ]

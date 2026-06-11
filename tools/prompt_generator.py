@@ -8,6 +8,39 @@ from core.state_machine import SAGEStateMachine, SAGEState, Hypothesis, TestResu
 from experiment_variants import VariantConfig, get_variant_config
 
 
+DYNAMIC_STEER_DESIGN_PROMPT = """\
+You are designing one Neuronpedia steering probe for an SAE feature.
+
+Goal: create a short continuation prompt that tests whether amplifying the
+feature causally supports the current hypothesis. The prompt should elicit
+output tokens, syntax, or continuation behavior predicted by the hypothesis.
+
+Current hypothesis:
+{hypothesis_text}
+
+Top activating exemplars:
+{top_exemplars}
+
+Recent input-side tests:
+{recent_test_results}
+
+Return exactly one JSON object and no extra text:
+{{
+  "prompt": "3 to 120 whitespace-separated tokens; not copied from any exemplar",
+  "expected_boost_tokens": ["tokens or short strings expected to become more likely"],
+  "expected_suppress_tokens": ["tokens or short strings expected to become less likely"],
+  "rationale": "brief reason this probe targets the hypothesis"
+}}
+
+Rules:
+- Do not paste a top exemplar or a long substring of an exemplar.
+- Prefer a compact natural prefix that makes the model continue in the target
+  domain, format, or discourse pattern.
+- Focus on output-token elicitation, not restating the hypothesis.
+- If uncertain, still return the best targeted probe as valid JSON.
+"""
+
+
 class PromptGenerator:
     """动态Prompt生成器 - 根据状态生成定制Prompt"""
     
@@ -134,9 +167,13 @@ Hypothesis_4: [Additional hypothesis covering different aspects]"""
 - Mark such claims as tentative unless later output/logit/steering evidence is available.
 """
 
+        logit_lens_block = self._format_logit_lens_block()
+        steering_prior_block = self._format_steering_prior_block()
+        triage_block = self._format_triage_block()
+
         return f"""
 **ROUND 2/{self.sm.max_rounds} - ANALYZE EXEMPLARS & FORM HYPOTHESES**
-{passive_note}{output_aware_note}
+{passive_note}{output_aware_note}{logit_lens_block}{steering_prior_block}{triage_block}
 
 **Task**: We have executed the maximum activation test on the corpus. Your mission is to systematically analyze and interpret specific SAE features. After analyzing the exemplar data, you MUST explicitly state hypotheses.
 
@@ -380,9 +417,11 @@ Evidence: Test shows '▁for'=13.8 in "That's it for now", consistent with corpu
             else "- REFINE when the hypothesis captures only part of the observed behavior or needs sharper boundaries."
         )
 
+        ocrs_block = self._format_ocrs_evidence_block()
+
         return f"""
 **ROUND {self.sm.round + 1}/{self.sm.max_rounds} - UPDATE HYPOTHESIS**
-{urgency_note}{current_hyp_info}
+{urgency_note}{current_hyp_info}{ocrs_block}
 **YOUR TASK**: Update Hypothesis {self.sm.current_hypothesis_id if self.sm.current_hypothesis_id else 'X'} based on test analysis.
 
 **Context**:
@@ -606,6 +645,9 @@ When suggesting additional tests, format them EXACTLY like this so they can be a
     
     def _prompt_final_conclusion(self) -> str:
         """最终结论的Prompt"""
+        if getattr(self.variant_config, "one_shot_description", False):
+            return self._prompt_one_shot_final_description()
+
         evidence_summary = self._compile_evidence()
         
         # Check是否达到最大round
@@ -630,6 +672,8 @@ When suggesting additional tests, format them EXACTLY like this so they can be a
 - Separate input-activation claims from causal/output-role claims.
 """
 
+        global_steering_block = self._format_global_steering_synthesis_block()
+
         return f"""
 **ROUND {self.sm.round + 1}/{self.sm.max_rounds} - FINAL CONCLUSION**
 {max_round_note}
@@ -639,6 +683,7 @@ When suggesting additional tests, format them EXACTLY like this so they can be a
 **All Evidence**:
 {evidence_summary}
 {output_aware_requirement}
+{global_steering_block}
 
 **Hypothesis Status**:
 {self._format_all_hypotheses()}
@@ -716,7 +761,372 @@ Must be specific and complete. Include activation ranges and statistical evidenc
 - Base conclusion on provided evidence
 - Be scientific and evidence-based
 """
+
+    def _prompt_one_shot_final_description(self) -> str:
+        """One-shot feature description from MaxAct exemplars + output evidence."""
+        exemplars_summary = self._summarize_exemplars_for_hypothesis()
+        output_evidence_block = self._format_one_shot_output_evidence()
+        return f"""
+**ROUND {self.sm.round + 1}/{self.sm.max_rounds} - ONE-SHOT FEATURE DESCRIPTION**
+
+**Current State**: Provide final conclusion directly from evidence.
+**Variant Contract**:
+- This run intentionally skips hypothesis formation, active tests, review, and refinement.
+- You must write the final feature explanation in one pass from the evidence below.
+- Treat corpus exemplars as input-side activation evidence.
+- Treat any output-side evidence as auxiliary causal or vocabulary evidence.
+- If input and output evidence diverge, say so explicitly rather than forcing a single clean concept.
+
+**Input-side evidence: high-activating corpus exemplars**
+{exemplars_summary}
+
+{output_evidence_block}
+
+**Required Output Format**:
+```
+[DESCRIPTION]:
+[2-4 sentences. Describe what input contexts activate the feature, and, if supported, what amplifying the feature changes in model outputs. Mention uncertainty or input-output divergence when present.]
+
+[EVIDENCE]:
+- MaxAct evidence: [summarize the strongest input-side pattern with activation ranges]
+- Output evidence: [summarize VocabProj and/or steering evidence if present; otherwise say this run used MaxAct only]
+- Caveat: [state any mismatch, noise, or uncertainty]
+
+[LABEL 1]: [concise standalone label for the main feature interpretation]
+[LABEL 2]: [optional only if there is a genuinely distinct second facet]
+```
+
+**Guidelines**:
+- Be specific about exact tokens, casing, punctuation, code/markup, position, and local context when the exemplars show them.
+- Do not invent synthetic test results; no tests were run.
+- Do not overfit to a single output token if output-side evidence is noisy.
+- Prefer a polysemantic or input/output-divergent description when MaxAct and output evidence point to different facets.
+- Labels must be self-contained and information-rich enough to be evaluated without the full description.
+
+**Rules**:
+- Do NOT issue [TOOL] commands.
+- Output only the required sections.
+- Base all claims on the evidence shown here.
+"""
+
+    def _format_one_shot_output_evidence(self) -> str:
+        """Render all output-side evidence available to a one-shot variant."""
+        blocks = []
+        if getattr(self.variant_config, "enable_logit_lens", False):
+            blocks.append(self._format_one_shot_logit_lens_evidence())
+        if getattr(self.variant_config, "enable_steering_prior", False):
+            blocks.append(self._format_one_shot_steering_evidence())
+        if not blocks:
+            return (
+                "**Output-side evidence**:\n"
+                "- None. This one-shot baseline uses MaxAct exemplars only.\n"
+            )
+        return "\n".join(blocks)
+
+    def _format_one_shot_logit_lens_evidence(self) -> str:
+        """Render VocabProj/logit-lens evidence for one-shot prompts."""
+        data = getattr(self.sm, "logit_lens_data", None)
+        if not data:
+            return (
+                "**Output-side evidence: VocabProj / logit-lens**\n"
+                "- No logit-lens evidence was available.\n"
+            )
+        pos_pairs = list(zip(data.get("pos_tokens", []), data.get("pos_values", [])))[:20]
+        neg_pairs = list(zip(data.get("neg_tokens", []), data.get("neg_values", [])))[:20]
+        pos_line = ", ".join(f"{t!r}({v:+.2f})" for t, v in pos_pairs) or "(none)"
+        neg_line = ", ".join(f"{t!r}({v:+.2f})" for t, v in neg_pairs) or "(none)"
+        return (
+            "**Output-side evidence: VocabProj / logit-lens**\n"
+            f"- Tokens promoted by W_U projection: {pos_line}\n"
+            f"- Tokens suppressed by W_U projection: {neg_line}\n"
+            "- Treat this as vocabulary-level output evidence, not as a complete input-side description.\n"
+        )
+
+    def _format_one_shot_steering_evidence(self) -> str:
+        """Render the one-shot steering prior for the final description prompt."""
+        data = getattr(self.sm, "steering_prior_data", None)
+        if not data:
+            return (
+                "**Output-side evidence: feature steering / TokenChange**\n"
+                "- No steering evidence was available.\n"
+            )
+        boosted = ", ".join(
+            repr(t) for t in (data.get("boosted_any_position") or [])[:20]
+        ) or "(none)"
+        suppressed = ", ".join(
+            repr(t) for t in (data.get("suppressed_any_position") or [])[:20]
+        ) or "(none)"
+        default_text = (data.get("default_text") or "")[:260]
+        steered_text = (data.get("steered_text") or "")[:260]
+        return (
+            "**Output-side evidence: feature steering / TokenChange**\n"
+            f"- Steering prompt: {data.get('prompt', '')!r}\n"
+            f"- Strength: {data.get('strength')}\n"
+            f"- Tokens boosted by feature amplification: {boosted}\n"
+            f"- Tokens suppressed by feature amplification: {suppressed}\n"
+            f"- Default continuation: {default_text!r}\n"
+            f"- Steered continuation: {steered_text!r}\n"
+        )
     
+    def _format_logit_lens_block(self) -> str:
+        """SAGE-Causal: render the cached logit-lens projection as a markdown block.
+
+        Returns an empty string when the variant has not enabled logit-lens injection
+        or the controller has not yet populated state_machine.logit_lens_data.
+        """
+        if not self.variant_config.enable_logit_lens:
+            return ""
+        data = getattr(self.sm, "logit_lens_data", None)
+        if not data:
+            return ""
+        pos_pairs = list(zip(data.get("pos_tokens", []), data.get("pos_values", [])))[:10]
+        neg_pairs = list(zip(data.get("neg_tokens", []), data.get("neg_values", [])))[:10]
+        pos_line = ", ".join(f"{t!r}({v:+.2f})" for t, v in pos_pairs) or "(none)"
+        neg_line = ", ".join(f"{t!r}({v:+.2f})" for t, v in neg_pairs) or "(none)"
+        return (
+            "\n**Output-direction prior (W_U projection of feature decoder)**:\n"
+            f"- Tokens this feature boosts at the output: {pos_line}\n"
+            f"- Tokens this feature suppresses at the output: {neg_line}\n"
+            "- Treat as an independent evidence source. For mid-layer features the\n"
+            "  semantically aligned family may sit in either set.\n"
+        )
+
+    def _format_triage_block(self) -> str:
+        """SAGE-Causal: tell the agent which path was selected and the budget contract."""
+        if not self.variant_config.enable_triage:
+            return ""
+        path = getattr(self.sm, "triage_path", None)
+        if not path:
+            return ""
+        signals = getattr(self.sm, "triage_signals", {}) or {}
+        agreement = signals.get("agreement")
+        direction = signals.get("direction")
+        entropy = signals.get("out_entropy")
+        sig_line = ""
+        if agreement is not None:
+            sig_line = (
+                f" (agreement={agreement:.3f}"
+                f"{f', direction={direction}' if direction else ''}"
+                f"{f', out_entropy={entropy:.3f}' if entropy is not None else ''})"
+            )
+        path_guidance = {
+            "FAST": "Exemplars and output-direction agree strongly — feature is likely monosemantic. Aim for 1 sharp hypothesis; do not over-generate alternatives.",
+            "STANDARD": "Moderate agreement — standard SAGE workflow applies. Generate 2-3 distinct hypotheses.",
+            "DEEP": "Low agreement OR diffuse output direction — feature is likely polysemantic, formatting-shaped, or input-output divergent. Generate 3-4 hypotheses covering distinct facets; consider that the exemplar-implied trigger and the output-direction may describe different aspects of the same feature.",
+        }.get(path, "")
+        return (
+            f"\n**Triage path: {path}{sig_line}**\n"
+            f"- {path_guidance}\n"
+        )
+
+    def _format_steering_prior_block(self) -> str:
+        """Ablation 5: render the one-shot steering result as an additional output-side
+        prior block in ANALYZE_EXEMPLARS, parallel to the logit-lens block. No-op for
+        variants that don't enable `enable_steering_prior`."""
+        if not getattr(self.variant_config, "enable_steering_prior", False):
+            return ""
+        data = getattr(self.sm, "steering_prior_data", None)
+        if not data:
+            return ""
+        boosted = ", ".join(repr(t) for t in (data.get("boosted_any_position") or [])[:15]) or "(none)"
+        suppressed = ", ".join(repr(t) for t in (data.get("suppressed_any_position") or [])[:15]) or "(none)"
+        default_text = (data.get("default_text") or "")[:160]
+        steered_text = (data.get("steered_text") or "")[:160]
+        prompt = data.get("prompt", "")
+        return (
+            "\n**Output-side prior (steering @ strength=8, exemplar-derived prompt):**\n"
+            f"- Test prompt: {prompt!r}\n"
+            f"- Tokens BOOSTED across positions when this feature is amplified: {boosted}\n"
+            f"- Tokens SUPPRESSED across positions when this feature is amplified: {suppressed}\n"
+            f"- Default continuation: {default_text!r}\n"
+            f"- Steered continuation: {steered_text!r}\n"
+            "- This is causal evidence — amplifying the feature directly produced these output changes.\n"
+        )
+
+    def _format_ocrs_evidence_block(self) -> str:
+        """SAGE-Causal: when OCRS has just fired, inject the causal evidence.
+
+        Forced-closure mode (default) tells the LLM it MUST pick CONFIRMED/REFUTED.
+        no_force_exit mode keeps the same evidence but makes the decision contract
+        advisory, so the LLM may choose REFINED/UNCHANGED and stay in the loop.
+        no_evidence mode (ablation 6) renders only the trigger without any boost/
+        suppress tokens so we can test whether evidence content matters.
+        """
+        if not self.variant_config.enable_ocrs:
+            return ""
+        evidence = getattr(self.sm, "ocrs_evidence", None)
+        if not evidence:
+            return ""
+        trigger = getattr(self.sm, "ocrs_trigger_reason", "deterministic OCRS trigger")
+        is_lens_only = evidence.get("source") == "logit_lens"
+        is_withheld = evidence.get("source") == "withheld"
+        force_exit = getattr(self.variant_config, "enable_force_exit", True)
+        boosted = ", ".join(repr(t) for t in (evidence.get("boosted_any_position") or [])[:15]) or "(none)"
+        suppressed = ", ".join(repr(t) for t in (evidence.get("suppressed_any_position") or [])[:15]) or "(none)"
+        shes_snapshot = evidence.get("shes_snapshot") or []
+        shes_lines = ""
+        if shes_snapshot:
+            rows = []
+            for item in shes_snapshot:
+                recent = ", ".join(f"{score:.3f}" for score in item.get("recent_scores", []))
+                rows.append(
+                    f"  - H{item.get('hypothesis_id')}: score={float(item.get('score', 0.0)):.3f}, "
+                    f"tests={item.get('tests')}, recent=[{recent}], status={item.get('status')}"
+                )
+            shes_lines = (
+                "- SHES stagnation snapshot (Hypothesis Evidence Score from activation-margin tests):\n"
+                + "\n".join(rows)
+                + "\n"
+            )
+        if is_withheld:
+            evidence_lines = (
+                f"{shes_lines}"
+                "- Causal/output evidence intentionally withheld for this evaluation.\n"
+                "  - We have detected refine spin via the trigger above but are NOT\n"
+                "    showing you the output-side boost/suppress tokens.\n"
+                "  - Decide using the existing input-side test history only.\n"
+            )
+        elif is_lens_only:
+            evidence_lines = (
+                f"{shes_lines}"
+                "- Causal evidence (logit-lens output projection W_U @ feature_direction; "
+                "no method-time steering call):\n"
+                f"  - Tokens this feature most strongly PROMOTES at the output: {boosted}\n"
+                f"  - Tokens this feature most strongly SUPPRESSES at the output: {suppressed}\n"
+            )
+        else:
+            prompt = evidence.get("prompt", "")
+            default_text = (evidence.get("default_text") or "")[:160]
+            steered_text = (evidence.get("steered_text") or "")[:160]
+            prompt_source = evidence.get("steering_prompt_source") or "static"
+            if prompt_source == "dynamic":
+                source_label = "hypothesis-conditioned dynamic steering probe"
+            else:
+                source_label = "static exemplar-derived steering probe"
+            spec = evidence.get("steer_prompt_spec") or {}
+            spec_lines = ""
+            if spec:
+                expected_boost = ", ".join(
+                    repr(t) for t in (spec.get("expected_boost_tokens") or [])[:12]
+                ) or "(none)"
+                expected_suppress = ", ".join(
+                    repr(t) for t in (spec.get("expected_suppress_tokens") or [])[:12]
+                ) or "(none)"
+                rationale = (spec.get("rationale") or "")[:220]
+                spec_lines = (
+                    "  - Dynamic probe expectation:\n"
+                    f"    - Expected boosted tokens: {expected_boost}\n"
+                    f"    - Expected suppressed tokens: {expected_suppress}\n"
+                    f"    - Rationale: {rationale!r}\n"
+                )
+            evidence_lines = (
+                f"{shes_lines}"
+                f"- Causal evidence source={prompt_source} ({source_label}); "
+                f"steering at strength={evidence.get('strength', 8)}, prompt={prompt!r}:\n"
+                f"{spec_lines}"
+                f"  - Tokens BOOSTED by amplifying this feature: {boosted}\n"
+                f"  - Tokens SUPPRESSED by amplifying this feature: {suppressed}\n"
+                f"  - Default continuation: {default_text!r}\n"
+                f"  - Steered continuation: {steered_text!r}\n"
+            )
+        if force_exit and is_withheld:
+            header = "**SHES-OCRS CHECKPOINT — input-test evidence has stagnated (output evidence withheld)**"
+            decision_block = (
+                "- **MANDATORY DECISION**: Based on the existing input-side test history, choose:\n"
+                "  - `CONFIRMED` if the available input evidence still best supports this hypothesis.\n"
+                "  - `REFUTED` if the available input evidence has actually refuted it.\n"
+                "  - Do NOT choose REFINED or UNCHANGED here. Further input tests have been deemed unproductive for this hypothesis.\n"
+            )
+        elif force_exit:
+            header = "**SHES-OCRS CHECKPOINT — input-test evidence has stagnated**"
+            decision_block = (
+                "- **MANDATORY DECISION**: Based on whether the causal evidence aligns with the current hypothesis, choose:\n"
+                "  - `CONFIRMED` if the boosted/suppressed tokens are consistent with this hypothesis (input + output converge)\n"
+                "  - `REFUTED` if the causal evidence describes a DIFFERENT facet than this hypothesis (input/output divergent — this hypothesis only captured part of the feature)\n"
+                "  - If the output evidence is sparse or incoherent, still make the best terminal decision from the combined input history and evidence shown here.\n"
+                "  - Do NOT choose REFINED or UNCHANGED here. Further input tests have been deemed unproductive for this hypothesis.\n"
+            )
+        else:
+            header = "**SHES-OCRS EVIDENCE INJECTION — additional output-side context**"
+            decision_block = (
+                "- **GUIDANCE**: Use the causal evidence to inform your normal UPDATE choice.\n"
+                "  - Pick `CONFIRMED` if input AND output evidence both align with this hypothesis.\n"
+                "  - Pick `REFUTED` if the output evidence clearly contradicts this hypothesis.\n"
+                "  - Pick `REFINED` if the output evidence suggests a sharper or different formulation that you can articulate now.\n"
+                "  - Pick `UNCHANGED` only if the output evidence does not change your assessment.\n"
+            )
+        return (
+            f"\n{header}\n"
+            f"- Trigger: {trigger}\n"
+            f"{evidence_lines}"
+            f"{decision_block}"
+        )
+
+    def _format_global_steering_synthesis_block(self) -> str:
+        """Render final-stage evidence for global steering synthesis."""
+        if not getattr(self.variant_config, "enable_global_steering_synthesis", False):
+            return ""
+
+        lens_block = self._format_final_logit_projection_evidence()
+        steering_block = self._format_final_causal_generation_evidence()
+        reason = getattr(self.sm, "global_steering_reason", None) or "not triggered before final synthesis"
+        return f"""
+**Global Evidence Synthesis Mode**:
+- Local steering was NOT used to locally CONFIRM or REFUTE hypotheses.
+- Refinement bottleneck reason: {reason}
+- Your role now is to synthesize three evidence sources and write the best final explanation.
+
+**Dimension 1 - Observational Evidence**:
+- Corpus exemplars and synthetic `model.run` tests above show what naturally activates the feature.
+- Treat this as the primary evidence for the input-side description.
+
+**Dimension 2 - Logit Projection Evidence**:
+{lens_block}
+
+**Dimension 3 - Causal Generation Evidence**:
+{steering_block}
+
+**Synthesis Contract**:
+- Compare candidate hypotheses against all three dimensions.
+- If steering generations are noisy or prompt-dependent, explicitly downweight them instead of overfitting.
+- If input evidence and causal generation evidence describe different facets, write a polysemantic or input/output-divergent explanation.
+- Do not discard a well-supported input hypothesis solely because one steering prompt conflicts.
+- In [EVIDENCE], include a short "Global steering synthesis:" paragraph summarizing how the three dimensions agree or disagree.
+"""
+
+    def _format_final_logit_projection_evidence(self) -> str:
+        data = getattr(self.sm, "logit_lens_data", None)
+        if not data:
+            return "- No logit projection evidence was available."
+        pos_pairs = list(zip(data.get("pos_tokens", []), data.get("pos_values", [])))[:12]
+        neg_pairs = list(zip(data.get("neg_tokens", []), data.get("neg_values", [])))[:12]
+        pos_line = ", ".join(f"{t!r}({v:+.2f})" for t, v in pos_pairs) or "(none)"
+        neg_line = ", ".join(f"{t!r}({v:+.2f})" for t, v in neg_pairs) or "(none)"
+        return (
+            f"- Output tokens most directly promoted by W_U projection: {pos_line}\n"
+            f"- Output tokens most directly suppressed by W_U projection: {neg_line}\n"
+            "- Use this as a low-noise vocabulary-level semantic prior, not as a complete description by itself."
+        )
+
+    def _format_final_causal_generation_evidence(self) -> str:
+        evidence = getattr(self.sm, "global_steering_evidence", None) or []
+        if not evidence:
+            return "- No global steering generations were collected."
+        lines = []
+        for i, item in enumerate(evidence, 1):
+            boosted = ", ".join(repr(t) for t in (item.get("boosted_any_position") or [])[:12]) or "(none)"
+            suppressed = ", ".join(repr(t) for t in (item.get("suppressed_any_position") or [])[:12]) or "(none)"
+            default_text = (item.get("default_text") or "")[:240]
+            steered_text = (item.get("steered_text") or "")[:240]
+            lines.append(
+                f"{i}. Prompt {item.get('prompt')!r}, strength={item.get('strength')}:\n"
+                f"   - Boosted tokens: {boosted}\n"
+                f"   - Suppressed tokens: {suppressed}\n"
+                f"   - Default continuation: {default_text!r}\n"
+                f"   - Steered continuation: {steered_text!r}"
+            )
+        return "\n".join(lines)
+
     def _summarize_exemplars(self) -> str:
         """压缩exemplar数据为简短摘要"""
         if not self.sm.exemplars:

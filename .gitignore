@@ -42,10 +42,12 @@ Thumbs.db
 *.log
 
 # Results and cache (if they contain sensitive data)
-results/
+results*/
 analysis*/
 output/
 cache/
+*smoke*
+test_api.py
 
 # Local backups
 *.backup
