@@ -10,6 +10,11 @@ from core.state_machine import SAGEState
 
 class OutputValidator:
     """输出验证器 - 验证LLM输出格式"""
+    HYPOTHESIS_HEADER_PATTERN = r"Hypothesis_\d+(?:\s*\([^:\n]*\))?:"
+    HYPOTHESIS_EXTRACT_PATTERN = (
+        r"Hypothesis_(\d+)(?:\s*\([^:\n]*\))?:\s*"
+        r"(.+?)(?=Hypothesis_\d+(?:\s*\([^:\n]*\))?:|$)"
+    )
     
     def __init__(self, top_k: int = 10, min_hypotheses: int = 3):
         self.top_k = top_k
@@ -81,17 +86,21 @@ class OutputValidator:
                 return False, "OBSERVATION section too short. Need at least 10 words."
         
         # Check是否有编号的假设
-        hypothesis_pattern = r"Hypothesis_\d+:"
-        if not re.search(hypothesis_pattern, output):
+        if not re.search(self.HYPOTHESIS_HEADER_PATTERN, output):
             return False, "No numbered hypotheses found (use Hypothesis_1:, Hypothesis_2:, etc.)"
         
         # Check minimum hypothesis count
-        hypothesis_count = len(re.findall(hypothesis_pattern, output))
+        hypothesis_count = len(re.findall(self.HYPOTHESIS_HEADER_PATTERN, output))
         if hypothesis_count < self.min_hypotheses:
             return False, f"Only {hypothesis_count} hypotheses found. Need at least {self.min_hypotheses}."
         
         # Check假设内容质量
-        hypotheses = re.findall(r"Hypothesis_\d+:\s*(.+?)(?=Hypothesis_|$)", output, re.DOTALL)
+        hypotheses = [
+            match[1]
+            for match in re.findall(
+                self.HYPOTHESIS_EXTRACT_PATTERN, output, re.DOTALL
+            )
+        ]
         for i, hyp in enumerate(hypotheses, 1):
             hyp_text = hyp.strip()
 
@@ -107,17 +116,21 @@ class OutputValidator:
             return False, "Missing [HYPOTHESIS LIST]: header"
         
         # Check是否有编号的假设
-        hypothesis_pattern = r"Hypothesis_\d+:"
-        if not re.search(hypothesis_pattern, output):
+        if not re.search(self.HYPOTHESIS_HEADER_PATTERN, output):
             return False, "No numbered hypotheses found (use Hypothesis_1:, Hypothesis_2:, etc.)"
         
         # Check minimum hypothesis count
-        hypothesis_count = len(re.findall(hypothesis_pattern, output))
+        hypothesis_count = len(re.findall(self.HYPOTHESIS_HEADER_PATTERN, output))
         if hypothesis_count < self.min_hypotheses:
             return False, f"Only {hypothesis_count} hypotheses found. Need at least {self.min_hypotheses}."
         
         # Check假设内容质量
-        hypotheses = re.findall(r"Hypothesis_\d+:\s*(.+?)(?=Hypothesis_|$)", output, re.DOTALL)
+        hypotheses = [
+            match[1]
+            for match in re.findall(
+                self.HYPOTHESIS_EXTRACT_PATTERN, output, re.DOTALL
+            )
+        ]
         for i, hyp in enumerate(hypotheses, 1):
             hyp_text = hyp.strip()
             if len(hyp_text.split()) < 5:
@@ -340,8 +353,7 @@ class OutputValidator:
     def extract_hypotheses(self, output: str) -> List[Dict[str, str]]:
         """从输出中提取假设"""
         hypotheses = []
-        pattern = r"Hypothesis_(\d+):\s*(.+?)(?=Hypothesis_|$)"
-        matches = re.findall(pattern, output, re.DOTALL)
+        matches = re.findall(self.HYPOTHESIS_EXTRACT_PATTERN, output, re.DOTALL)
         
         for match in matches:
             hypothesis_id = int(match[0])

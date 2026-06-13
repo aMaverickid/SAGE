@@ -34,7 +34,7 @@ class Tools:
                  store_batch_size: int = 8, default_max_samples: int = 5000,
                  use_saedashboard: bool = True, use_api_for_activations: bool = False,
                  neuronpedia_model_id: Optional[str] = None, neuronpedia_source: Optional[str] = None,
-                 default_top_k: int = 10) -> None:
+                 default_top_k: int = 10, api_debug: bool = False) -> None:
         self.system = system
         self.agent_llm_name = agent_llm_name
         self.dataset_path = dataset_path
@@ -51,6 +51,7 @@ class Tools:
         self.neuronpedia_model_id = neuronpedia_model_id
         self.neuronpedia_source = neuronpedia_source
         self.default_top_k = default_top_k
+        self.api_debug = api_debug
         self._log: List[Dict[str, str]] = []
         self._activations_store = None  # Lazy initialization
 
@@ -69,7 +70,8 @@ class Tools:
             neuronpedia_model_id=neuronpedia_model_id,
             neuronpedia_source=neuronpedia_source,
             dataset_name=dataset_name,
-            dataset_config=dataset_config
+            dataset_config=dataset_config,
+            api_debug=api_debug,
         )
 
         print(f"📊 Tools Configuration:")
@@ -82,6 +84,7 @@ class Tools:
         print(f"   Use API for activations: {use_api_for_activations}")
         if use_api_for_activations:
             print(f"   Neuronpedia API: model_id={neuronpedia_model_id}, source={neuronpedia_source}")
+            print(f"   API debug logging: {api_debug}")
 
         # Try to initialize ActivationsStore (if using HF dataset)
         if self.dataset_name and use_activations_store:

@@ -73,6 +73,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neuronpedia_model_id", default="gemma-2-2b")
     parser.add_argument("--sae_path", default=DEFAULT_SAE_PATH)
     parser.add_argument("--generation_jobs", type=int, default=4)
+    parser.add_argument(
+        "--generation_timeout_minutes",
+        type=float,
+        default=45.0,
+        help="Wall-clock timeout per (variant, feature) generation subprocess. "
+             "Timed-out features are marked skipped by run_manifest.py so "
+             "resume can move on.",
+    )
     parser.add_argument("--input_jobs", type=int, default=8)
     parser.add_argument("--llm_jobs", type=int, default=3)
     parser.add_argument("--device", default="cuda")
@@ -143,7 +151,8 @@ def _commands_for(args: argparse.Namespace) -> List[List[str]]:
     if args.stage == "ranking":
         commands.append(_ranking_cmd(args))
     if args.stage in {"all", "ranking"}:
-        commands.append(_ocrs_audit_cmd(args))
+        commands.append(_effciency_cmd(args))
+        commands.append(_shes_cmd(args))
     return commands
 
 
@@ -208,6 +217,8 @@ def _generate_cmd(args: argparse.Namespace) -> List[str]:
         args.generation_device,
         "--jobs",
         str(args.generation_jobs),
+        "--timeout_minutes",
+        str(args.generation_timeout_minutes),
     ]
     _add_resume_flags(cmd, args)
     if args.force_generate:
@@ -292,11 +303,22 @@ def _ranking_cmd(args: argparse.Namespace) -> List[str]:
     ])
     return cmd
 
-
-def _ocrs_audit_cmd(args: argparse.Namespace) -> List[str]:
+def _effciency_cmd(args: argparse.Namespace) -> List[str]:
     return [
         sys.executable,
-        "scripts/summarize_ocrs_audit.py",
+        "scripts/summarize_efficiency.py",
+        "--results_root",
+        args.results_root,
+        "--output_dir",
+        args.output_dir,
+        "--variants",
+        args.variants,
+    ]
+
+def _shes_cmd(args: argparse.Namespace) -> List[str]:
+    return [
+        sys.executable,
+        "scripts/summarize_shes.py",
         "--results_root",
         args.results_root,
         "--output_dir",

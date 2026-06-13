@@ -398,6 +398,7 @@ def _run_task(task: Task, timeout_minutes: Optional[float]) -> Dict[str, Any]:
         row["status"] = "timed_out"
         row["returncode"] = None
         row["error"] = str(exc)
+        _write_timeout_skip(task, timeout_minutes)
     except Exception as exc:
         row["status"] = "error"
         row["returncode"] = None
@@ -406,6 +407,28 @@ def _run_task(task: Task, timeout_minutes: Optional[float]) -> Dict[str, Any]:
     row["duration_seconds"] = time.time() - started
     row["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     return row
+
+
+def _write_timeout_skip(task: Task, timeout_minutes: Optional[float]) -> None:
+    """Mark a timed-out feature as skipped so resume can keep moving."""
+    task.result_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": "skipped",
+        "reason": "generation_timeout",
+        "detail": (
+            f"Generation subprocess exceeded {timeout_minutes} minute(s) "
+            "and was skipped by scripts/run_manifest.py."
+        ),
+        "feature_spec": task.feature_spec,
+        "experiment_variant": task.variant,
+        "failure_mode": "timeout",
+        "manifest_path": str(task.manifest_path),
+        "log_path": str(task.log_path),
+        "timeout_minutes": timeout_minutes,
+        "skipped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    skip_path = task.result_dir / "skipped_log.json"
+    skip_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _status_from_result(task: Task, returncode: int) -> str:

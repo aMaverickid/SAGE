@@ -122,21 +122,18 @@ class SAGEController:
         """执行单轮分析"""
         self.execution_stats["total_rounds"] += 1
         current_state = self.state_machine.state
-        
+
         if self.debug:
             print(f"\n--- Round {self.state_machine.round} ---")
             print(f"State: {current_state.value}")
-        
-        # Round 0: 自动转换到GET_EXEMPLARS，不使用LLM
+
         if current_state == SAGEState.INIT:
             self.state_machine.transition(SAGEState.GET_EXEMPLARS)
             return True
-        
-        # Round 1: 自动执行GET_EXEMPLARS，不使用LLM
+
         if current_state == SAGEState.GET_EXEMPLARS:
             return self._auto_execute_get_exemplars()
-        
-        # PARALLEL_HYPOTHESIS_TESTING: 并行假设处理入口
+
         if current_state == SAGEState.PARALLEL_HYPOTHESIS_TESTING:
             handled = self._execute_parallel_hypothesis_testing()
             if (
@@ -147,23 +144,7 @@ class SAGEController:
                 self.execution_stats["successful_rounds"] += 1
                 self.consecutive_failures = 0
             return handled
-        
-        # DESIGN_TEST: 仅用于非并行模式的旧逻辑（已废弃，保留用于兼容性）
-        # In ... mode，DESIGN_TEST由_process_hypothesis_design_test处理
-        if current_state == SAGEState.DESIGN_TEST:
-            # Check是否在并行模式下
-            if self.state_machine.current_hypothesis_id:
-                # 并行模式下不应该直接进入DESIGN_TEST，这应该通过PARALLEL_HYPOTHESIS_TESTING处理
-                if self.debug:
-                    print("⚠️  DESIGN_TEST state in parallel mode, redirecting to PARALLEL_HYPOTHESIS_TESTING")
-                self.state_machine.transition(SAGEState.PARALLEL_HYPOTHESIS_TESTING)
-                return True
-            else:
-                # 非并行模式，使用旧逻辑
-                return self._execute_design_test_with_immediate_run()
-        
-        # 其他轮次使用LLM
-        # 1. 生成当前状态的Prompt
+
         print(f"🔄 Generating prompt for state: {current_state.value}")
         if current_state == SAGEState.FINAL_CONCLUSION and self.variant_config.output_aware:
             self._capture_output_aware_note()
@@ -641,6 +622,14 @@ class SAGEController:
                     "shes_pre_update_checkpoint",
                     hypothesis_id=hypothesis.id,
                     active_hypotheses=self._shes_active_checkpoint_rows(),
+                    hypothesis_test_count=len(hypothesis.test_history),
+                    global_test_count=len(self.state_machine.test_history),
+                    steering_calls_used=getattr(
+                        self.state_machine, "steering_calls_used", 0,
+                    ),
+                    dynamic_steer_attempts=getattr(
+                        self.state_machine, "dynamic_steer_attempts", 0,
+                    ),
                 )
                 handled_by_ocrs = self._sage_causal_maybe_run_ocrs(
                     hypothesis,
@@ -658,6 +647,14 @@ class SAGEController:
                             else None
                         ),
                         ocrs_outcome=getattr(hypothesis, "ocrs_outcome", None),
+                        hypothesis_test_count=len(hypothesis.test_history),
+                        global_test_count=len(self.state_machine.test_history),
+                        steering_calls_used=getattr(
+                            self.state_machine, "steering_calls_used", 0,
+                        ),
+                        dynamic_steer_attempts=getattr(
+                            self.state_machine, "dynamic_steer_attempts", 0,
+                        ),
                     )
                     if self.debug:
                         print(
@@ -965,7 +962,7 @@ class SAGEController:
                             print(f"⚠️  Error parsing tokens: {e}")
         
         return exemplars
-    
+
     def _get_llm_response_with_retry(self, prompt: str, max_retries: int = 3) -> str:
         """获取LLM响应，带重试机制和上下文压缩
 
@@ -1134,6 +1131,19 @@ Please provide output again following the required format.
         # According to当前状态生成默认响应
         fallback_response = self._generate_fallback_response()
         self._process_output(self.state_machine.state, fallback_response)
+
+        if (
+            self.state_machine.state == SAGEState.ANALYZE_EXEMPLARS
+            and self.variant_config.max_initial_hypotheses > 0
+            and not self.state_machine.hypotheses
+        ):
+            self.error_reason = "no_hypotheses_after_analyze_exemplars"
+            self.error_detail = (
+                "ANALYZE_EXEMPLARS validation failed and fallback did not "
+                "produce parseable hypotheses."
+            )
+            self._force_conclude()
+            return
         
         # Force状态转换，避免无限循环
         try:
@@ -1157,12 +1167,14 @@ Please provide output again following the required format.
         elif current_state == SAGEState.ANALYZE_EXEMPLARS:
             return """
 OBSERVATION:
-- Pattern 1: [Analysis needed]
-- Pattern 2: [Analysis needed]
-- Common elements: [Analysis needed]
+- Pattern 1: The exemplar evidence could not be parsed reliably after repeated validation failures.
+- Pattern 2: Additional active testing is needed before making a specific feature claim.
+- Common elements: The feature requires systematic follow-up tests based on corpus activations.
 
-PRELIMINARY HYPOTHESIS:
-This feature requires further analysis.
+[HYPOTHESIS LIST]:
+Hypothesis_1: This feature responds to a recurring token or token pattern in the top activating corpus examples.
+Hypothesis_2: This feature may depend on surrounding context rather than only the highest activating token itself.
+Hypothesis_3: Negative control texts without the observed corpus token pattern should show low activation.
 """
         
         elif current_state == SAGEState.FORM_HYPOTHESIS:
@@ -2384,6 +2396,9 @@ This feature requires further investigation due to insufficient data.
             "support_margin": clipped_margin,
             "score": new_score,
             "round": self.state_machine.round,
+            "hypothesis_test_count": len(hypothesis.test_history),
+            "global_test_count": len(self.state_machine.test_history),
+            "active_hypothesis_count": len(self.state_machine.get_active_hypotheses()),
         }
         hypothesis.evidence_score_history.append(event)
         self.state_machine.shes_events.append(event)
@@ -2409,49 +2424,97 @@ This feature requires further investigation due to insufficient data.
         return "unknown"
 
     def _shes_check_stagnation_trigger(self, hypothesis: Hypothesis) -> Optional[str]:
-        """Return a SHES trigger once all active hypotheses have stagnant scores."""
+        """Return a SHES trigger once the current hypothesis has stagnated."""
         if not getattr(self.variant_config, "enable_shes", False):
             return None
-        active = [
-            h for h in self.state_machine.get_active_hypotheses()
-            if getattr(h, "ocrs_outcome", None) is None
-        ]
-        if not active:
+        if getattr(hypothesis, "ocrs_outcome", None) is not None:
             return None
 
         window = max(2, int(getattr(self.state_machine, "shes_window", 2)))
         epsilon = float(getattr(self.state_machine, "shes_epsilon", 0.08))
         min_tests = max(window, int(getattr(self.state_machine, "shes_min_tests", 2)))
-        diagnostics = []
-        for h in active:
-            history = getattr(h, "evidence_score_history", [])
-            if len(history) < min_tests:
-                return None
-            recent = history[-window:]
-            scores = [float(item.get("score", 0.0)) for item in recent]
-            score_span = max(scores) - min(scores) if scores else 0.0
-            diagnostics.append({
-                "hypothesis_id": h.id,
-                "tests": len(history),
-                "score": float(getattr(h, "evidence_score", 0.0)),
-                "recent_score_span": score_span,
-            })
-            if score_span > epsilon:
-                return None
+        history = getattr(hypothesis, "evidence_score_history", [])
+        if len(history) < min_tests:
+            return None
+
+        recent = history[-window:]
+        scores = [float(item.get("score", 0.0)) for item in recent]
+        score_span = max(scores) - min(scores) if scores else 0.0
+        diagnostic = {
+            "hypothesis_id": hypothesis.id,
+            "tests": len(history),
+            "score": float(getattr(hypothesis, "evidence_score", 0.0)),
+            "recent_score_span": score_span,
+            "recent_scores": scores,
+        }
+        if score_span > epsilon:
+            return None
 
         reason = (
-            f"shes_stagnation(window={window},epsilon={epsilon:.3f},"
-            f"active={len(active)})"
+            f"shes_stagnation_per_hypothesis("
+            f"h={hypothesis.id},window={window},epsilon={epsilon:.3f})"
+        )
+        metrics = self._shes_trigger_metrics(
+            hypothesis=hypothesis,
+            reason=reason,
+            score_span=score_span,
+            recent_scores=scores,
         )
         self.state_machine.shes_triggered = True
         self.state_machine.shes_trigger_reason = reason
+        self.state_machine.shes_events.append({
+            "event": "trigger",
+            **metrics,
+        })
         self._record_action(
             "shes_stagnation_detected",
             hypothesis_id=hypothesis.id,
             reason=reason,
-            diagnostics=diagnostics,
+            policy="per_hypothesis",
+            diagnostics=[diagnostic],
+            **metrics,
         )
         return reason
+
+    def _shes_trigger_metrics(
+        self,
+        hypothesis: Hypothesis,
+        reason: str,
+        score_span: float,
+        recent_scores: List[float],
+    ) -> Dict[str, Any]:
+        """Return structured SHES trigger audit fields without affecting control flow."""
+        hypothesis_tests = len(getattr(hypothesis, "evidence_score_history", []) or [])
+        global_tests = len(self.state_machine.test_history)
+        return {
+            "trigger_reason": reason,
+            "trigger_round": self.state_machine.round,
+            "trigger_test_id": (
+                int(hypothesis.evidence_score_history[-1].get("test_id", 0))
+                if hypothesis.evidence_score_history else None
+            ),
+            "trigger_hypothesis_id": hypothesis.id,
+            "trigger_hypothesis_tests": hypothesis_tests,
+            "trigger_global_tests": global_tests,
+            "tests_before_trigger_hypothesis": max(0, hypothesis_tests - 1),
+            "tests_before_trigger_global": max(0, global_tests - 1),
+            "trigger_score": float(getattr(hypothesis, "evidence_score", 0.0)),
+            "trigger_recent_score_span": score_span,
+            "trigger_recent_scores": recent_scores,
+            "active_hypothesis_count": len(self.state_machine.get_active_hypotheses()),
+            "steering_calls_used_before_trigger": getattr(
+                self.state_machine, "steering_calls_used", 0,
+            ),
+            "steering_calls_budget": getattr(
+                self.state_machine, "steering_calls_budget", None,
+            ),
+            "dynamic_steer_attempts_before_trigger": getattr(
+                self.state_machine, "dynamic_steer_attempts", 0,
+            ),
+            "dynamic_steer_fallbacks_before_trigger": getattr(
+                self.state_machine, "dynamic_steer_fallbacks", 0,
+            ),
+        }
 
     def _sage_causal_maybe_run_ocrs(
         self,
@@ -2559,6 +2622,17 @@ This feature requires further investigation due to insufficient data.
                 trigger=trigger,
                 prompt_length=len(prompt),
                 force_exit=force_exit,
+                hypothesis_test_count=len(hypothesis.test_history),
+                global_test_count=len(self.state_machine.test_history),
+                steering_calls_used=getattr(
+                    self.state_machine, "steering_calls_used", 0,
+                ),
+                dynamic_steer_attempts=getattr(
+                    self.state_machine, "dynamic_steer_attempts", 0,
+                ),
+                dynamic_steer_fallbacks=getattr(
+                    self.state_machine, "dynamic_steer_fallbacks", 0,
+                ),
             )
             wrapper_tag = (
                 "OCRS FORCED CLOSURE" if force_exit else "OCRS EVIDENCE INJECTION"
@@ -2569,6 +2643,8 @@ This feature requires further investigation due to insufficient data.
                 "sage_causal_ocrs_response",
                 hypothesis_id=hypothesis.id,
                 response_length=len(llm_output),
+                trigger=trigger,
+                force_exit=force_exit,
             )
         finally:
             # Clear so it doesn't leak into other hypotheses' prompts.
@@ -2612,6 +2688,14 @@ This feature requires further investigation due to insufficient data.
                 refined=False,
                 trigger=trigger,
                 force_exit=True,
+                hypothesis_test_count=len(hypothesis.test_history),
+                global_test_count=len(self.state_machine.test_history),
+                steering_calls_used=getattr(
+                    self.state_machine, "steering_calls_used", 0,
+                ),
+                dynamic_steer_attempts=getattr(
+                    self.state_machine, "dynamic_steer_attempts", 0,
+                ),
             )
             hypothesis.current_state = None
             hypothesis.refined_streak = 0
@@ -2641,6 +2725,14 @@ This feature requires further investigation due to insufficient data.
                 refined=False,
                 trigger=trigger,
                 force_exit=False,
+                hypothesis_test_count=len(hypothesis.test_history),
+                global_test_count=len(self.state_machine.test_history),
+                steering_calls_used=getattr(
+                    self.state_machine, "steering_calls_used", 0,
+                ),
+                dynamic_steer_attempts=getattr(
+                    self.state_machine, "dynamic_steer_attempts", 0,
+                ),
             )
             hypothesis.current_state = None
             hypothesis.refined_streak = 0
@@ -2661,6 +2753,14 @@ This feature requires further investigation due to insufficient data.
                     refined=False,
                     trigger=trigger,
                     force_exit=False,
+                    hypothesis_test_count=len(hypothesis.test_history),
+                    global_test_count=len(self.state_machine.test_history),
+                    steering_calls_used=getattr(
+                        self.state_machine, "steering_calls_used", 0,
+                    ),
+                    dynamic_steer_attempts=getattr(
+                        self.state_machine, "dynamic_steer_attempts", 0,
+                    ),
                 )
             hypothesis.current_state = SAGEState.DESIGN_TEST
         if self.debug:
@@ -2763,7 +2863,18 @@ This feature requires further investigation due to insufficient data.
             },
             {"role": "user", "content": prompt},
         ]
-        return ask_agent(self.llm_client, history)
+        model = getattr(self.variant_config, "dynamic_steer_llm", None) or self.llm_client
+        max_tokens = int(
+            getattr(self.variant_config, "dynamic_steer_max_completion_tokens", 768)
+            or 768
+        )
+        self._record_action(
+            "sage_causal_dynamic_steer_llm_call",
+            model=model,
+            max_completion_tokens=max_tokens,
+            prompt_length=len(prompt),
+        )
+        return ask_agent(model, history, max_completion_tokens=max_tokens)
 
     def _sage_causal_fetch_ocrs_evidence(
         self, hypothesis: Hypothesis, trigger: str
@@ -2787,10 +2898,12 @@ This feature requires further investigation due to insufficient data.
 
         exemplar_dicts = [
             {
-                "tokens": getattr(ex, "tokens", []) or [],
-                "per_token_activations": getattr(ex, "per_token_activations", []) or [],
+                "tokens": (getattr(ex, "tokens", []) or [])[:40],
+                "per_token_activations": (
+                    getattr(ex, "per_token_activations", []) or []
+                )[:40],
                 "max_activation": getattr(ex, "activation", 0.0),
-                "text": getattr(ex, "text", ""),
+                "text": (getattr(ex, "text", "") or "")[:500],
             }
             for ex in (self.state_machine.exemplars or [])
         ]
@@ -2804,8 +2917,15 @@ This feature requires further investigation due to insufficient data.
             try:
                 dynamic_spec = _sc_design_steer_prompt(
                     hypothesis_text=hypothesis.text,
-                    top_exemplars=exemplar_dicts[: self.top_k],
-                    recent_test_results=self._recent_test_results_for_dynamic_steer(hypothesis),
+                    top_exemplars=exemplar_dicts[
+                        : int(getattr(self.variant_config, "dynamic_steer_top_exemplars", 3))
+                    ],
+                    recent_test_results=self._recent_test_results_for_dynamic_steer(
+                        hypothesis,
+                        limit=int(
+                            getattr(self.variant_config, "dynamic_steer_recent_tests", 2)
+                        ),
+                    ),
                     llm_caller=self._call_dynamic_steer_llm,
                 )
                 prompt = dynamic_spec.prompt

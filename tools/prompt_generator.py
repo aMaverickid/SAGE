@@ -24,12 +24,12 @@ Top activating exemplars:
 Recent input-side tests:
 {recent_test_results}
 
-Return exactly one JSON object and no extra text:
+Return exactly one compact JSON object and no extra text:
 {{
   "prompt": "3 to 120 whitespace-separated tokens; not copied from any exemplar",
-  "expected_boost_tokens": ["tokens or short strings expected to become more likely"],
-  "expected_suppress_tokens": ["tokens or short strings expected to become less likely"],
-  "rationale": "brief reason this probe targets the hypothesis"
+  "expected_boost_tokens": ["1-6 tokens or short strings expected to become more likely"],
+  "expected_suppress_tokens": ["0-6 tokens or short strings expected to become less likely"],
+  "rationale": "one sentence, max 20 words"
 }}
 
 Rules:
@@ -38,6 +38,7 @@ Rules:
   domain, format, or discourse pattern.
 - Focus on output-token elicitation, not restating the hypothesis.
 - If uncertain, still return the best targeted probe as valid JSON.
+- Keep the entire JSON under 160 words.
 """
 
 

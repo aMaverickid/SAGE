@@ -70,6 +70,10 @@ class VariantConfig:
     shes_min_tests: int = 2
     shes_threshold_factor: float = 0.5
     one_shot_description: bool = False
+    dynamic_steer_llm: str = "gpt-5-mini"
+    dynamic_steer_max_completion_tokens: int = 768
+    dynamic_steer_top_exemplars: int = 3
+    dynamic_steer_recent_tests: int = 2
     description: str = "Full SAGE workflow"
 
     def to_dict(self) -> Dict[str, object]:
@@ -278,8 +282,9 @@ def get_variant_config(name: str) -> VariantConfig:
             description=(
                 "SHES-OCRS: uses stagnation in Hypothesis Evidence Scores as the "
                 "early-termination trigger, then optionally injects one steering "
-                "signal before forcing a terminal hypothesis decision. Incoherent "
-                "steering evidence falls back to the normal input-side workflow."
+                "signal before forcing a terminal hypothesis decision. Supported, "
+                "divergent, and incoherent steering evidence are all injected before "
+                "forced commitment."
             ),
         ),
         "shes_ocrs_no_force_exit": VariantConfig(

@@ -53,31 +53,39 @@ def main() -> None:
     epsilons = [float(item) for item in split_csv(args.epsilons)]
     feature_rows = []
     skipped_rows = []
+    seen_skipped_dirs = set()
     for variant in variants:
         for path in sorted((results_root / variant).rglob("structured_results.json")):
             row = load_feature_row(path, args.window, args.min_tests)
             if row.get("status") == "skipped" or str(row.get("failure_mode") or "").startswith("skipped_"):
                 skipped_rows.append(row)
+                seen_skipped_dirs.add(path.parent)
                 continue
             feature_rows.append(row)
+        for path in sorted((results_root / variant).rglob("skipped_log.json")):
+            if path.parent in seen_skipped_dirs:
+                continue
+            skipped_rows.append(load_skipped_row(path, variant))
 
     summary_rows = summarize_by_variant(feature_rows)
     layer_summary_rows = summarize_by_variant_layer(feature_rows)
     sweep_rows = sweep_epsilons(feature_rows, epsilons, args.window, args.min_tests)
+    skipped_summary_rows = summarize_skipped_by_variant(skipped_rows)
 
     write_json(output_dir / "shes_feature_rows.json", feature_rows)
     write_json(output_dir / "shes_skipped_rows.json", skipped_rows)
+    write_json(output_dir / "shes_skipped_summary.json", skipped_summary_rows)
     write_json(output_dir / "shes_summary.json", summary_rows)
     write_json(output_dir / "shes_layer_summary.json", layer_summary_rows)
     write_json(output_dir / "shes_epsilon_sweep.json", sweep_rows)
+    write_csv(output_dir / "shes_skipped_summary.csv", skipped_summary_rows)
     write_csv(output_dir / "shes_summary.csv", summary_rows)
     write_csv(output_dir / "shes_layer_summary.csv", layer_summary_rows)
     write_csv(output_dir / "shes_epsilon_sweep.csv", sweep_rows)
 
     print(f"Wrote SHES summary to {output_dir}")
     if skipped_rows:
-        skipped_by_variant = summarize_skipped_by_variant(skipped_rows)
-        for row in skipped_by_variant:
+        for row in skipped_summary_rows:
             print(
                 f"{row['variant']}: skipped_n={row['skipped_n']} "
                 f"({row['skip_reasons']})"
@@ -108,6 +116,7 @@ def load_feature_row(
 ) -> Dict[str, Any]:
     data = json.loads(path.read_text())
     shes = data.get("sage_causal", {}).get("shes", {}) or {}
+    sage_causal = data.get("sage_causal", {}) or {}
     hyps = data.get("hypotheses", []) or []
     usage = normalize_token_usage(data.get("token_usage") or {})
     variant = data.get("experiment_variant") or path.relative_to(path.parents[5]).parts[0]
@@ -116,6 +125,7 @@ def load_feature_row(
     test_count = count_tests(data)
     update_stats = summarize_update_texts(data)
     trace_hypotheses = trace_hypotheses_by_id(data)
+    trigger_event = actual_trigger_event(shes, data)
     return {
         "path": str(path),
         "status": data.get("status"),
@@ -129,6 +139,19 @@ def load_feature_row(
         "actual_triggered": bool(shes.get("triggered")),
         "actual_trigger_reason": shes.get("trigger_reason"),
         "actual_epsilon": shes.get("epsilon"),
+        "trigger_round": trigger_event.get("trigger_round"),
+        "trigger_test_id": trigger_event.get("trigger_test_id"),
+        "trigger_hypothesis_id": trigger_event.get("trigger_hypothesis_id"),
+        "trigger_hypothesis_tests": trigger_event.get("trigger_hypothesis_tests"),
+        "trigger_global_tests": trigger_event.get("trigger_global_tests"),
+        "tests_before_trigger_hypothesis": trigger_event.get(
+            "tests_before_trigger_hypothesis"
+        ),
+        "tests_before_trigger_global": trigger_event.get(
+            "tests_before_trigger_global"
+        ),
+        "trigger_score": trigger_event.get("trigger_score"),
+        "trigger_recent_score_span": trigger_event.get("trigger_recent_score_span"),
         "window": window,
         "min_tests": min_tests,
         "tests": test_count,
@@ -138,6 +161,15 @@ def load_feature_row(
         "llm_calls": usage.get("total_calls", 0),
         "total_tokens": usage.get("total_tokens", 0),
         "cost_usd": usage.get("total_cost_usd", 0.0),
+        "steering_calls_used": sage_causal.get("steering_calls_used", 0),
+        "steering_calls_logged": len(sage_causal.get("steering_calls_log", []) or []),
+        "dynamic_steer_attempts": sage_causal.get("dynamic_steer_attempts", 0),
+        "dynamic_steer_fallbacks": sage_causal.get("dynamic_steer_fallbacks", 0),
+        "dynamic_steer_successes": max(
+            0,
+            int(sage_causal.get("dynamic_steer_attempts", 0) or 0)
+            - int(sage_causal.get("dynamic_steer_fallbacks", 0) or 0),
+        ),
         "hypotheses": [
             {
                 "id": h.get("id"),
@@ -150,6 +182,30 @@ def load_feature_row(
             for h in hyps
         ],
         "actions": relevant_trace_actions(data),
+    }
+
+
+def load_skipped_row(path: Path, variant: str) -> Dict[str, Any]:
+    data = json.loads(path.read_text())
+    spec = data.get("feature_spec") or {}
+    return {
+        "path": str(path),
+        "status": data.get("status", "skipped"),
+        "skip_reason": data.get("reason"),
+        "skip_detail": data.get("detail"),
+        "variant": data.get("experiment_variant") or variant,
+        "layer": spec.get("layer_index"),
+        "feature_id": spec.get("feature_index"),
+        "final_state": "Skipped",
+        "failure_mode": data.get("failure_mode") or "skipped",
+        "actual_triggered": False,
+        "actual_trigger_reason": None,
+        "tests": 0,
+        "test_count": 0,
+        "rounds": 0,
+        "llm_calls": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
     }
 
 
@@ -189,6 +245,41 @@ def summarize_shes_group(
         "actual_trigger_rate": safe_mean(
             [1.0 if row.get("actual_triggered") else 0.0 for row in group]
         ),
+        "avg_trigger_hypothesis_tests": safe_mean(
+            [
+                row.get("trigger_hypothesis_tests")
+                for row in group
+                if row.get("actual_triggered")
+            ]
+        ),
+        "avg_trigger_global_tests": safe_mean(
+            [
+                row.get("trigger_global_tests")
+                for row in group
+                if row.get("actual_triggered")
+            ]
+        ),
+        "avg_tests_before_trigger_hypothesis": safe_mean(
+            [
+                row.get("tests_before_trigger_hypothesis")
+                for row in group
+                if row.get("actual_triggered")
+            ]
+        ),
+        "avg_tests_before_trigger_global": safe_mean(
+            [
+                row.get("tests_before_trigger_global")
+                for row in group
+                if row.get("actual_triggered")
+            ]
+        ),
+        "avg_trigger_recent_score_span": safe_mean(
+            [
+                row.get("trigger_recent_score_span")
+                for row in group
+                if row.get("actual_triggered")
+            ]
+        ),
         "avg_tests": safe_mean([row.get("tests", 0) for row in group]),
         "avg_update_text_count": safe_mean(
             [row.get("update_text_count", 0) for row in group]
@@ -212,6 +303,22 @@ def summarize_shes_group(
         "avg_llm_calls": safe_mean([row.get("llm_calls", 0) for row in group]),
         "avg_total_tokens": safe_mean([row.get("total_tokens", 0) for row in group]),
         "avg_cost_usd": safe_mean([row.get("cost_usd", 0.0) for row in group]),
+        "avg_steering_calls_used": safe_mean(
+            [row.get("steering_calls_used", 0) for row in group]
+        ),
+        "avg_dynamic_steer_attempts": safe_mean(
+            [row.get("dynamic_steer_attempts", 0) for row in group]
+        ),
+        "avg_dynamic_steer_fallbacks": safe_mean(
+            [row.get("dynamic_steer_fallbacks", 0) for row in group]
+        ),
+        "avg_dynamic_steer_successes": safe_mean(
+            [row.get("dynamic_steer_successes", 0) for row in group]
+        ),
+        "dynamic_steer_fallback_rate": safe_ratio(
+            sum(int(row.get("dynamic_steer_fallbacks", 0) or 0) for row in group),
+            sum(int(row.get("dynamic_steer_attempts", 0) or 0) for row in group),
+        ),
     }
     if layer is not None:
         out = {"variant": variant, "layer": layer, **{k: v for k, v in out.items() if k != "variant"}}
@@ -242,6 +349,39 @@ def normalize_token_usage(raw: Dict[str, Any]) -> Dict[str, Any]:
         return raw
     summary = raw.get("summary")
     return summary if isinstance(summary, dict) else {}
+
+
+def actual_trigger_event(shes: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the explicit SHES trigger event from current traces, if present."""
+    for event in shes.get("events", []) or []:
+        if isinstance(event, dict) and event.get("event") == "trigger":
+            return event
+    actions = (
+        ((data.get("experiment_trace") or {}).get("actions"))
+        or data.get("agent_actions")
+        or []
+    )
+    for action in actions:
+        if isinstance(action, dict) and action.get("action") == "shes_stagnation_detected":
+            return {
+                "trigger_round": action.get("trigger_round") or action.get("round"),
+                "trigger_test_id": action.get("trigger_test_id"),
+                "trigger_hypothesis_id": (
+                    action.get("trigger_hypothesis_id")
+                    or action.get("hypothesis_id")
+                ),
+                "trigger_hypothesis_tests": action.get("trigger_hypothesis_tests"),
+                "trigger_global_tests": action.get("trigger_global_tests"),
+                "tests_before_trigger_hypothesis": action.get(
+                    "tests_before_trigger_hypothesis"
+                ),
+                "tests_before_trigger_global": action.get(
+                    "tests_before_trigger_global"
+                ),
+                "trigger_score": action.get("trigger_score"),
+                "trigger_recent_score_span": action.get("trigger_recent_score_span"),
+            }
+    return {}
 
 
 def count_tests(data: Dict[str, Any]) -> int:
@@ -395,6 +535,20 @@ def relevant_trace_actions(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "trigger",
                 "reason",
                 "active_hypotheses",
+                "hypothesis_test_count",
+                "global_test_count",
+                "trigger_round",
+                "trigger_test_id",
+                "trigger_hypothesis_id",
+                "trigger_hypothesis_tests",
+                "trigger_global_tests",
+                "tests_before_trigger_hypothesis",
+                "tests_before_trigger_global",
+                "trigger_score",
+                "trigger_recent_score_span",
+                "steering_calls_used",
+                "dynamic_steer_attempts",
+                "dynamic_steer_fallbacks",
             }
         }
         out.append(compact)
@@ -489,7 +643,7 @@ def counterfactual_trigger_checkpoints(
     window: int,
     min_tests: int,
 ) -> Optional[Dict[str, Any]]:
-    """Replay explicit SHES decision checkpoints from post-fix traces."""
+    """Replay explicit SHES checkpoints with per-hypothesis trigger semantics."""
     histories: Dict[int, List[Dict[str, Any]]] = {}
     total_tests = 0
     for action in sorted(row.get("actions", []), key=lambda item: int(item.get("idx", 0))):
@@ -500,22 +654,18 @@ def counterfactual_trigger_checkpoints(
             continue
         if action.get("action") != "shes_pre_update_checkpoint":
             continue
-        active_ids = [
-            int(item.get("hypothesis_id"))
-            for item in (action.get("active_hypotheses") or [])
-            if item.get("hypothesis_id") is not None
-        ]
-        active = {
-            hyp_id: histories.get(hyp_id, [])
-            for hyp_id in active_ids
-        }
-        if all_stagnant(active, epsilon, max(2, window), max(window, min_tests)):
-            all_seen = [item for history in histories.values() for item in history]
+        hyp_id = action.get("hypothesis_id")
+        if hyp_id is None:
+            continue
+        hyp_id = int(hyp_id)
+        history = histories.get(hyp_id, [])
+        if hypothesis_stagnant(history, epsilon, max(2, window), max(window, min_tests)):
             return {
                 "round": action.get("round"),
-                "test_id": max(int(item.get("test_id", 0)) for item in all_seen),
+                "test_id": int(history[-1].get("test_id", 0)),
                 "total_tests": total_tests,
-                "mode": "checkpoint_trace",
+                "mode": "checkpoint_trace_per_hypothesis",
+                "hypothesis_id": hyp_id,
             }
     return None
 
@@ -526,7 +676,7 @@ def counterfactual_trigger_online(
     window: int,
     min_tests: int,
 ) -> Optional[Dict[str, Any]]:
-    """Replay compact trace actions using online active-hypothesis status."""
+    """Replay compact trace actions using per-hypothesis trigger semantics."""
     hyp_ids = [
         int(h["id"])
         for h in row.get("hypotheses", [])
@@ -536,6 +686,7 @@ def counterfactual_trigger_online(
         return None
     histories: Dict[int, List[Dict[str, Any]]] = {hyp_id: [] for hyp_id in hyp_ids}
     statuses: Dict[int, str] = {hyp_id: "PENDING" for hyp_id in hyp_ids}
+    last_scored_hypothesis_id: Optional[int] = None
 
     for action in sorted(row.get("actions", []), key=lambda item: int(item.get("idx", 0))):
         action_name = action.get("action")
@@ -543,21 +694,22 @@ def counterfactual_trigger_online(
             hyp_id = int(action.get("hypothesis_id", -1))
             if hyp_id in histories:
                 histories[hyp_id].append(action)
+                last_scored_hypothesis_id = hyp_id
             continue
 
         if action_name == "llm_response" and action.get("state") == "Analyze result":
-            active = {
-                hyp_id: histories.get(hyp_id, [])
-                for hyp_id in hyp_ids
-                if statuses.get(hyp_id) not in ("CONFIRMED", "REFUTED")
-            }
-            if all_stagnant(active, epsilon, max(2, window), max(window, min_tests)):
+            hyp_id = last_scored_hypothesis_id
+            if hyp_id is None or statuses.get(hyp_id) in ("CONFIRMED", "REFUTED"):
+                continue
+            history = histories.get(hyp_id, [])
+            if hypothesis_stagnant(history, epsilon, max(2, window), max(window, min_tests)):
                 all_seen = [item for history in histories.values() for item in history]
                 return {
                     "round": action.get("round"),
-                    "test_id": max(int(item.get("test_id", 0)) for item in all_seen),
+                    "test_id": int(history[-1].get("test_id", 0)),
                     "total_tests": len(all_seen),
-                    "mode": "online_trace",
+                    "mode": "online_trace_per_hypothesis",
+                    "hypothesis_id": hyp_id,
                 }
             continue
 
@@ -626,20 +778,33 @@ def all_stagnant(
     if not histories:
         return False
     for history in histories.values():
-        if len(history) < min_tests:
-            return False
-        recent = history[-window:]
-        scores = [float(item.get("score", 0.0)) for item in recent]
-        if not scores:
-            return False
-        if max(scores) - min(scores) > epsilon:
+        if not hypothesis_stagnant(history, epsilon, window, min_tests):
             return False
     return True
+
+
+def hypothesis_stagnant(
+    history: List[Dict[str, Any]],
+    epsilon: float,
+    window: int,
+    min_tests: int,
+) -> bool:
+    if len(history) < min_tests:
+        return False
+    recent = history[-window:]
+    scores = [float(item.get("score", 0.0)) for item in recent]
+    if not scores:
+        return False
+    return max(scores) - min(scores) <= epsilon
 
 
 def safe_mean(values: Iterable[float]) -> float:
     vals = [float(v) for v in values if v is not None]
     return mean(vals) if vals else 0.0
+
+
+def safe_ratio(numerator: float, denominator: float) -> float:
+    return float(numerator) / float(denominator) if denominator else 0.0
 
 
 def write_json(path: Path, payload: Any) -> None:

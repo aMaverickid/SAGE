@@ -129,7 +129,11 @@ def get_content_from_message(message: Dict[str, Any]) -> List[Dict[str, Any]]:
 # Global chat session cache for persistent conversations
 _chat_sessions = {}
 
-def ask_agent(model: str, history: List[Dict[str, Any]]) -> str:
+def ask_agent(
+    model: str,
+    history: List[Dict[str, Any]],
+    max_completion_tokens: int = 4096,
+) -> str:
     """
     Ask an LLM agent for the next experiment step.
 
@@ -228,13 +232,13 @@ def ask_agent(model: str, history: List[Dict[str, Any]]) -> str:
                     params = {
                         "model": model,
                         "messages": history,
-                        "max_completion_tokens": 4096,
+                        "max_completion_tokens": max_completion_tokens,
                     }
                 else:
                     params = {
                         "model": model,
                         "messages": history,
-                        "max_tokens": 4096,
+                        "max_tokens": max_completion_tokens,
                     }
 
                 r = client.chat.completions.create(**params)
@@ -360,7 +364,7 @@ def ask_agent(model: str, history: List[Dict[str, Any]]) -> str:
                     raise RuntimeError(f"OpenAI not available and rate limit hit: {str(e)}")
                 count += 1
                 print(f'OpenAI API rate limit error: {str(e)}')
-                wait_time = 60 + 10*random()  # Random wait between 60-70 seconds
+                wait_time = 60 + 10 * random.random()  # Random wait between 60-70 seconds
                 print(f"Attempt {count}/{max_retries}. Waiting {wait_time:.1f} seconds...")
                 time.sleep(wait_time)
             elif "model" in str(e).lower() and "not found" in str(e).lower():
@@ -387,7 +391,7 @@ def ask_agent(model: str, history: List[Dict[str, Any]]) -> str:
                 raise RuntimeError(f"Anthropic not available and rate limit hit: {str(e)}")
             count += 1
             print(f'Anthropic API error: {str(e)}')
-            wait_time = 60 + 10*random()
+            wait_time = 60 + 10 * random.random()
             print(f"Attempt {count}/{max_retries}. Waiting {wait_time:.1f} seconds...")
             time.sleep(wait_time)
 
@@ -470,4 +474,3 @@ def validate_agent_response(response: str) -> bool:
 
 
 __all__ = ["AgentConfig", "SAGEAgent", "ask_agent"]
-

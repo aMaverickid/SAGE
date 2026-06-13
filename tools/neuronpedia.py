@@ -26,13 +26,15 @@ class NeuronpediaManager:
                  neuronpedia_model_id: Optional[str] = None,
                  neuronpedia_source: Optional[str] = None,
                  dataset_name: Optional[str] = None,
-                 dataset_config: Optional[str] = None):
+                 dataset_config: Optional[str] = None,
+                 api_debug: bool = False):
         self.system = system
         self.use_api_for_activations = use_api_for_activations
         self.neuronpedia_model_id = neuronpedia_model_id
         self.neuronpedia_source = neuronpedia_source
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
+        self.api_debug = api_debug
 
     def _extract_sae_info_from_path(self, sae_path: str) -> Dict[str, Optional[str]]:
         """Extract SAE set and path information from sae_path string.
@@ -406,10 +408,16 @@ class NeuronpediaManager:
         }
         
         try:
+            if self.api_debug:
+                self._print_api_debug("request", url, payload)
             response = requests.post(url, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
             
             result = response.json()
+            if self.api_debug:
+                self._print_api_debug(
+                    "response", url, result, status_code=response.status_code
+                )
             
             # API returns a list of activation objects
             if not isinstance(result, list):
@@ -462,3 +470,22 @@ class NeuronpediaManager:
                 return []
             else:
                 return []
+
+    def _print_api_debug(
+        self,
+        phase: str,
+        url: str,
+        payload: Any,
+        status_code: Optional[int] = None,
+        limit: int = 2000,
+    ) -> None:
+        """Print compact Neuronpedia API debug info to the process log."""
+        try:
+            body = json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception:
+            body = str(payload)
+        prefix = f"list_len={len(payload)} " if isinstance(payload, list) else ""
+        if len(body) > limit:
+            body = body[:limit] + "...<truncated>"
+        status = f" status={status_code}" if status_code is not None else ""
+        print(f"[API DEBUG] {phase.upper()} {url}{status}: {prefix}{body}")

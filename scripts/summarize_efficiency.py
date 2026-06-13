@@ -20,6 +20,7 @@ from scripts.eval_all_experiments import _summarize_efficiency
 FIELDS = [
     "variant",
     "efficiency_n",
+    "skipped_n",
     "done_n",
     "avg_llm_calls",
     "total_llm_calls",
@@ -99,6 +100,7 @@ def main() -> None:
     for row in rows:
         print(
             f"{row['variant']}: n={int(row['efficiency_n'])}, "
+            f"skipped={int(row.get('skipped_n', 0))}, "
             f"calls/f={row['avg_llm_calls']:.2f}, "
             f"tokens/f={row['avg_total_tokens']:.0f}, "
             f"sec/f={row['avg_duration_seconds']:.1f}, "

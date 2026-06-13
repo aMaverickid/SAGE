@@ -115,12 +115,15 @@ def _coerce_spec(data: Dict[str, Any]) -> SteerPromptSpec:
 
     return SteerPromptSpec(
         prompt=prompt.strip(),
-        expected_boost_tokens=_coerce_string_list(data.get("expected_boost_tokens"), "expected_boost_tokens"),
+        expected_boost_tokens=_coerce_string_list(
+            data.get("expected_boost_tokens"),
+            "expected_boost_tokens",
+        )[:6],
         expected_suppress_tokens=_coerce_string_list(
             data.get("expected_suppress_tokens"),
             "expected_suppress_tokens",
-        ),
-        rationale=rationale.strip(),
+        )[:6],
+        rationale=" ".join(rationale.strip().split()[:24]),
     )
 
 

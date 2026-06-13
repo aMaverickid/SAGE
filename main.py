@@ -176,6 +176,7 @@ def call_argparse():
     parser.add_argument('--use_api_for_activations', type=lambda x: x.lower() == 'true', default=False, help='Use Neuronpedia API for find_maximally_activating_examples and get_activation_trace (default: False)')
     parser.add_argument('--neuronpedia_model_id', type=str, default=None, help='Neuronpedia model ID for API calls (e.g., "gpt2-small", "gemma-2-2b", "llama3.1-8b-it"). If not provided, will be inferred from target_llm.')
     parser.add_argument('--neuronpedia_source', type=str, default=None, help='Neuronpedia source/layer identifier for API calls (e.g., "0-gemmascope-mlp-16k", "9-res-jb", "11-resid-post-aa"). Required if use_api_for_activations=True. If not provided, will be inferred from sae_path and layer.')
+    parser.add_argument('--api_debug', action='store_true', help='Print compact Neuronpedia API request/response summaries to process logs.')
 
     args = parser.parse_args()
     return args
@@ -340,7 +341,8 @@ def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int
             debug=args.debug,  # Pass debug parameter
             use_api_for_activations=args.use_api_for_activations,
             neuronpedia_model_id=neuronpedia_config['model_id'] if neuronpedia_config else None,
-            neuronpedia_source=neuronpedia_config['source'] if neuronpedia_config else None
+            neuronpedia_source=neuronpedia_config['source'] if neuronpedia_config else None,
+            api_debug=args.api_debug,
         )
 
         tools = Tools(
@@ -359,7 +361,8 @@ def run_single_feature_experiment(args, sae_layer_index: int, feature_index: int
             use_api_for_activations=args.use_api_for_activations,
             neuronpedia_model_id=neuronpedia_config['model_id'] if neuronpedia_config else None,
             neuronpedia_source=neuronpedia_config['source'] if neuronpedia_config else None,
-            default_top_k=args.top_k
+            default_top_k=args.top_k,
+            api_debug=args.api_debug,
         )
 
         experiment_env = ExperimentEnvironment(tools, debug=args.debug, default_top_k=args.top_k)

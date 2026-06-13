@@ -561,18 +561,14 @@ paper Section 3 写成：
 ### 18.1 单一 trigger 定义
 
 ```python
-def should_trigger_commit(state_machine, K: int = 2, epsilon: float = 0.05) -> bool:
-    """所有 active hypotheses 的 HES 在过去 K 轮里几乎不动 → input test 无新信息。"""
-    active = [h for h in state_machine.hypotheses
-              if h.status in ("PENDING", "REFINED", "UNCHANGED")
-              and len(h.hes_history) >= K + 1]
-    if not active:
+def should_trigger_commit(hypothesis, K: int = 2, epsilon: float = 0.05) -> bool:
+    """当前 hypothesis 的 HES 在过去 K 轮里几乎不动 → 该 hypothesis 的 input tests 无新信息。"""
+    if hypothesis.status not in ("PENDING", "REFINED", "UNCHANGED"):
         return False
-    max_delta = max(
-        abs(h.hes_history[-1] - h.hes_history[-K - 1])
-        for h in active
-    )
-    return max_delta < epsilon
+    if len(hypothesis.hes_history) < K + 1:
+        return False
+    delta = abs(hypothesis.hes_history[-1] - hypothesis.hes_history[-K - 1])
+    return delta < epsilon
 ```
 
 ### 18.2 Pre-registered defaults

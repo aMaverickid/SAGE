@@ -1193,6 +1193,7 @@ def _summarize_efficiency(
     wanted_features = manifest_feature_keys(manifest_path)
     by_variant: Dict[str, List[Dict[str, float]]] = {}
     skipped_by_variant: Dict[str, int] = {}
+    seen_skipped_dirs = set()
     for sr_path in results_root.rglob("structured_results.json"):
         try:
             data = json.loads(sr_path.read_text())
@@ -1212,6 +1213,7 @@ def _summarize_efficiency(
                 continue
         if is_skipped_result(sr_path, data):
             skipped_by_variant[variant] = skipped_by_variant.get(variant, 0) + 1
+            seen_skipped_dirs.add(sr_path.parent)
             continue
         usage = data.get("token_usage") or {}
         row = {
@@ -1234,6 +1236,27 @@ def _summarize_efficiency(
             "tests": float(len(data.get("test_results") or [])),
         }
         by_variant.setdefault(variant, []).append(row)
+
+    for skip_path in results_root.rglob("skipped_log.json"):
+        if skip_path.parent in seen_skipped_dirs:
+            continue
+        try:
+            data = json.loads(skip_path.read_text())
+        except Exception:
+            continue
+        variant = _infer_result_variant(results_root, skip_path, data)
+        if wanted and variant not in wanted:
+            continue
+        if wanted_features is not None:
+            spec = data.get("feature_spec") or {}
+            key = (
+                str(spec.get("neuronpedia_model_id") or ""),
+                str(spec.get("source") or ""),
+                int(spec.get("feature_index", data.get("feature_id", -1))),
+            )
+            if key not in wanted_features:
+                continue
+        skipped_by_variant[variant] = skipped_by_variant.get(variant, 0) + 1
 
     out: Dict[str, Dict[str, float]] = {}
     for variant in set(by_variant) | set(skipped_by_variant):
