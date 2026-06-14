@@ -3,20 +3,43 @@ SAGE Controller - Main controller integrating 3-layer architecture
 Integrates state machine, prompt generator, and output validator
 """
 
+import math
 import time
 import re
+import random
+from collections import defaultdict
 from typing import Dict, Any, Optional, Tuple, List
 from core.state_machine import SAGEStateMachine, SAGEState, Hypothesis, TestResult, Exemplar
 from tools.prompt_generator import PromptGenerator
 from tools.output_validator import OutputValidator
 from core.agent import ask_agent, validate_agent_response
+from experiment_variants import VariantConfig, get_variant_config
+
+# SAGE-Causal helpers (loaded lazily to avoid hard dep when running legacy variants
+# that don't talk to Neuronpedia).
+try:
+    from tools.logit_lens import get_logit_lens as _sc_get_logit_lens
+    from tools.dynamic_steer import (
+        design_steer_prompt as _sc_design_steer_prompt,
+    )
+    from tools.steering_api import (
+        steer_feature as _sc_steer_feature,
+        select_steering_prompt_from_exemplars as _sc_select_prompt,
+    )
+    from tools.agreement import compute_agreement as _sc_compute_agreement, select_path as _sc_select_path
+    _SAGE_CAUSAL_AVAILABLE = True
+except ImportError as _exc:  # pragma: no cover - import guard
+    _SAGE_CAUSAL_AVAILABLE = False
+    _SAGE_CAUSAL_IMPORT_ERROR = _exc
 
 
 class SAGEController:
     """SAGE main controller - integrates 3-layer architecture."""
     
     def __init__(self, feature_id: int, layer: int, llm_client, tools, experiment_env,
-                 debug: bool = False, max_rounds: int = 30, top_k: int = 10):
+                 debug: bool = False, max_rounds: int = 30, top_k: int = 10,
+                 experiment_variant: str = "full", variant_config: Optional[VariantConfig] = None,
+                 random_seed: int = 0, feature_spec: Optional[Dict[str, Any]] = None):
         self.feature_id = feature_id
         self.layer = layer
         self.llm_client = llm_client
@@ -24,11 +47,34 @@ class SAGEController:
         self.experiment_env = experiment_env
         self.debug = debug
         self.top_k = top_k
+        self.experiment_variant = experiment_variant or "full"
+        self.variant_config = variant_config or get_variant_config(self.experiment_variant)
+        self.random_seed = random_seed
+        self.feature_spec = feature_spec or {
+            "layer": f"layer{layer}",
+            "layer_index": layer,
+            "feature_index": feature_id,
+        }
+        self.rng = random.Random(random_seed)
+        self.agent_actions: List[Dict[str, Any]] = []
+        self.output_audit: Dict[str, Any] = {
+            "enabled": bool(self.variant_config.output_aware),
+            "status": "not_requested" if not self.variant_config.output_aware else "pending",
+            "notes": [],
+            "evidence": [],
+        }
+        self.error_reason: Optional[str] = None
+        self.error_detail: Optional[str] = None
         
         # Initialize 3-layer architecture
         self.state_machine = SAGEStateMachine(feature_id, layer, max_rounds)
-        self.prompt_generator = PromptGenerator(self.state_machine, top_k=self.top_k)
-        self.output_validator = OutputValidator(top_k=self.top_k)
+        self.prompt_generator = PromptGenerator(
+            self.state_machine,
+            top_k=self.top_k,
+            variant_config=self.variant_config,
+        )
+        min_hypotheses = 1 if self.variant_config.max_initial_hypotheses == 1 else 3
+        self.output_validator = OutputValidator(top_k=self.top_k, min_hypotheses=min_hypotheses)
         
         # Execution statistics
         self.execution_stats = {
@@ -50,13 +96,14 @@ class SAGEController:
         
         if self.debug:
             print(f"🚀 Starting SAGE Controller for Feature {self.feature_id} at Layer {self.layer}")
+            print(f"🧪 Variant: {self.experiment_variant}")
         
         try:
             while not self.state_machine.is_final_state():
                 self._execute_round()
                 
                 # Safety check
-                if self.state_machine.round > 20:
+                if self.state_machine.round > self.state_machine.max_rounds:
                     self._force_conclude()
                     break
             
@@ -64,51 +111,47 @@ class SAGEController:
             return self._compile_results()
             
         except Exception as e:
+            self.error_reason = "controller_exception"
+            self.error_detail = str(e)
             if self.debug:
                 print(f"❌ Controller error: {e}")
-            self._force_conclude()
+            self.execution_stats["end_time"] = time.time()
             return self._compile_results()
     
     def _execute_round(self):
         """执行单轮分析"""
         self.execution_stats["total_rounds"] += 1
         current_state = self.state_machine.state
-        
+
         if self.debug:
             print(f"\n--- Round {self.state_machine.round} ---")
             print(f"State: {current_state.value}")
-        
-        # Round 0: 自动转换到GET_EXEMPLARS，不使用LLM
+
         if current_state == SAGEState.INIT:
             self.state_machine.transition(SAGEState.GET_EXEMPLARS)
             return True
-        
-        # Round 1: 自动执行GET_EXEMPLARS，不使用LLM
+
         if current_state == SAGEState.GET_EXEMPLARS:
             return self._auto_execute_get_exemplars()
-        
-        # PARALLEL_HYPOTHESIS_TESTING: 并行假设处理入口
+
         if current_state == SAGEState.PARALLEL_HYPOTHESIS_TESTING:
-            return self._execute_parallel_hypothesis_testing()
-        
-        # DESIGN_TEST: 仅用于非并行模式的旧逻辑（已废弃，保留用于兼容性）
-        # In ... mode，DESIGN_TEST由_process_hypothesis_design_test处理
-        if current_state == SAGEState.DESIGN_TEST:
-            # Check是否在并行模式下
-            if self.state_machine.current_hypothesis_id:
-                # 并行模式下不应该直接进入DESIGN_TEST，这应该通过PARALLEL_HYPOTHESIS_TESTING处理
-                if self.debug:
-                    print("⚠️  DESIGN_TEST state in parallel mode, redirecting to PARALLEL_HYPOTHESIS_TESTING")
-                self.state_machine.transition(SAGEState.PARALLEL_HYPOTHESIS_TESTING)
-                return True
-            else:
-                # 非并行模式，使用旧逻辑
-                return self._execute_design_test_with_immediate_run()
-        
-        # 其他轮次使用LLM
-        # 1. 生成当前状态的Prompt
+            handled = self._execute_parallel_hypothesis_testing()
+            if (
+                getattr(self.variant_config, "enable_global_steering_synthesis", False)
+                and getattr(self.state_machine, "global_steering_triggered", False)
+                and self.state_machine.state == SAGEState.FINAL_CONCLUSION
+            ):
+                self.execution_stats["successful_rounds"] += 1
+                self.consecutive_failures = 0
+            return handled
+
         print(f"🔄 Generating prompt for state: {current_state.value}")
+        if current_state == SAGEState.FINAL_CONCLUSION and self.variant_config.output_aware:
+            self._capture_output_aware_note()
+        if current_state == SAGEState.FINAL_CONCLUSION:
+            self._sage_causal_maybe_collect_global_steering("final_conclusion_entry")
         prompt = self.prompt_generator.generate()
+        self._record_action("prompt_generated", state=current_state.value, prompt_length=len(prompt))
         
         print(f"✅ Generated prompt ({len(prompt)} chars)")
         if self.debug:
@@ -117,6 +160,7 @@ class SAGEController:
         # 2. 调用LLM (带重试机制)
         print(f"🤖 Calling LLM (this may take a while, especially if API key is not set)...")
         llm_output = self._get_llm_response_with_retry(prompt)
+        self._record_action("llm_response", state=current_state.value, response_length=len(llm_output))
         print(f"✅ Received LLM response ({len(llm_output)} chars)")
         
         # 3. 验证输出
@@ -177,6 +221,7 @@ class SAGEController:
             
             # 直接调用实验环境获取exemplars
             tool_output = self.experiment_env.execute_experiment(f"[TOOL] text_exemplars top_k={self.top_k}")
+            self._record_action("tool_call", state=SAGEState.GET_EXEMPLARS.value, tool="text_exemplars", top_k=self.top_k)
             
             if self.debug:
                 print(f"📊 Tool execution result:")
@@ -186,23 +231,47 @@ class SAGEController:
             success = self._process_tool_output("text_exemplars", tool_output)
             
             if success:
-                # 状态转换到ANALYZE_EXEMPLARS
-                self.state_machine.transition(SAGEState.ANALYZE_EXEMPLARS)
-                
+                if self.state_machine.skip_reason or self._maybe_skip_shes_no_positive_exemplars():
+                    self.execution_stats["successful_rounds"] += 1
+                    return True
+
+                # SAGE-Causal: compute logit-lens + triage path now that exemplars exist,
+                # so ANALYZE_EXEMPLARS prompt can carry the output-direction prior + path label.
+                self._sage_causal_apply_triage()
+                self._shes_initialize()
+                # SAGE-Causal: optionally precompute a one-shot steering result as
+                # an additional prior for ANALYZE_EXEMPLARS (Ablation 5 variant).
+                self._sage_causal_apply_steering_prior()
+
+                if getattr(self.variant_config, "one_shot_description", False):
+                    self._record_action(
+                        "one_shot_direct_to_final",
+                        steering_available=getattr(
+                            self.state_machine, "steering_prior_data", None
+                        ) is not None,
+                    )
+                    self.state_machine.transition(SAGEState.FINAL_CONCLUSION)
+                else:
+                    # 状态转换到ANALYZE_EXEMPLARS
+                    self.state_machine.transition(SAGEState.ANALYZE_EXEMPLARS)
+
                 if self.debug:
-                    print("✅ Auto-execution completed, transitioning to ANALYZE_EXEMPLARS")
-                
+                    print(
+                        "✅ Auto-execution completed, transitioning to "
+                        f"{self.state_machine.state.value}"
+                    )
+
                 self.execution_stats["successful_rounds"] += 1
                 return True
             else:
                 if self.debug:
                     print("❌ Tool output processing failed")
-                return False
+                raise RuntimeError("GET_EXEMPLARS produced no parseable exemplars")
             
         except Exception as e:
             if self.debug:
                 print(f"❌ Auto-execution failed: {e}")
-            return False
+            raise
     
     def _process_tool_output(self, tool_name: str, tool_output: str):
         """处理工具输出，更新状态机"""
@@ -251,6 +320,24 @@ class SAGEController:
                     print(f"📊 Stored {len(exemplars)} exemplars (parsed from text) to state machine")
                 else:
                     print("⚠️  No exemplars parsed from output")
+                    if (
+                        getattr(self.variant_config, "enable_shes", False)
+                        and "No corpus-based exemplars available" in str(tool_output)
+                    ):
+                        detail = (
+                            "GET_EXEMPLARS completed but Neuronpedia returned no "
+                            "corpus-based exemplar records. SHES threshold cannot "
+                            "be calibrated; skipping this feature."
+                        )
+                        self.state_machine.skip("no_exemplars_available", detail)
+                        self._record_action(
+                            "feature_skipped",
+                            reason="no_exemplars_available",
+                            detail=detail,
+                            exemplar_count=0,
+                        )
+                        return True
+                    return False
             except Exception as e:
                 print(f"❌ Error parsing exemplars: {e}")
                 import traceback
@@ -272,6 +359,18 @@ class SAGEController:
         为所有活跃假设同时执行一个步骤（DESIGN_TEST/ANALYZE_RESULT/UPDATE_HYPOTHESIS）
         每个假设独立维护自己的状态和循环
         """
+        if not self.variant_config.active_testing:
+            self._record_action(
+                "variant_skip",
+                state=SAGEState.PARALLEL_HYPOTHESIS_TESTING.value,
+                reason="active_testing_disabled",
+            )
+            for hypothesis in self.state_machine.hypotheses:
+                if hypothesis.status == "PENDING":
+                    hypothesis.status = "UNCHANGED"
+            self.state_machine.transition(SAGEState.REVIEW_ALL_HYPOTHESES)
+            return True
+
         # Check是否有补充测试需要执行（来自REVIEW）
         if hasattr(self.state_machine, 'supplemental_tests') and self.state_machine.supplemental_tests:
             if self.debug:
@@ -287,6 +386,7 @@ class SAGEController:
         if self.state_machine.all_hypotheses_finalized():
             if self.debug:
                 print("✅ All hypotheses finalized, transitioning to REVIEW_ALL_HYPOTHESES")
+            self._sage_causal_maybe_collect_global_steering("all_hypotheses_finalized")
             self.state_machine.transition(SAGEState.REVIEW_ALL_HYPOTHESES)
             return True
         
@@ -296,6 +396,7 @@ class SAGEController:
         if not active_hypotheses:
             if self.debug:
                 print("⚠️  No active hypotheses found, transitioning to REVIEW_ALL_HYPOTHESES")
+            self._sage_causal_maybe_collect_global_steering("no_active_hypotheses")
             self.state_machine.transition(SAGEState.REVIEW_ALL_HYPOTHESES)
             return True
         
@@ -310,6 +411,13 @@ class SAGEController:
         
         # 为每个活跃假设执行一个步骤
         for hypothesis in active_hypotheses:
+            if (
+                getattr(self.variant_config, "enable_global_steering_synthesis", False)
+                and getattr(self.state_machine, "global_steering_triggered", False)
+            ):
+                self.state_machine.transition(SAGEState.FINAL_CONCLUSION)
+                return True
+
             # Skip已完成的假设
             if hypothesis.status in ["CONFIRMED", "REFUTED"]:
                 continue
@@ -337,6 +445,13 @@ class SAGEController:
                     print(f"❌ Error processing H{hypothesis.id}: {e}")
                 # 发生错误时，重置为DESIGN_TEST
                 hypothesis.current_state = SAGEState.DESIGN_TEST
+
+            if (
+                getattr(self.variant_config, "enable_global_steering_synthesis", False)
+                and getattr(self.state_machine, "global_steering_triggered", False)
+            ):
+                self.state_machine.transition(SAGEState.FINAL_CONCLUSION)
+                return True
         
         # All假设处理完成后，继续保持在PARALLEL_HYPOTHESIS_TESTING状态
         # 下一轮会自动再次处理所有活跃假设
@@ -361,13 +476,35 @@ class SAGEController:
             self.state_machine.state = SAGEState.DESIGN_TEST
             prompt = self.prompt_generator.generate()
             self.state_machine.state = old_state  # Restore state
+            self._record_action(
+                "prompt_generated",
+                state=SAGEState.DESIGN_TEST.value,
+                hypothesis_id=hypothesis.id,
+                prompt_length=len(prompt),
+            )
 
             if self.debug:
                 print(f"   Generated prompt ({len(prompt)} chars)")
             
             # 2. 调用LLM获取测试设计（添加假设标识，避免混淆）
             prompt_with_id = f"[DESIGNING TEST FOR HYPOTHESIS {hypothesis.id} ONLY]\n{prompt}"
-            llm_output = self._get_llm_response_with_retry(prompt_with_id)
+            if not self.variant_config.targeted_tests:
+                llm_output = self._generate_variant_test_design(hypothesis)
+                self.tools.update_log(role='assistant', content=llm_output)
+                self._record_action(
+                    "variant_generated_test",
+                    hypothesis_id=hypothesis.id,
+                    variant=self.experiment_variant,
+                    output=llm_output,
+                )
+            else:
+                llm_output = self._get_llm_response_with_retry(prompt_with_id)
+                self._record_action(
+                    "llm_response",
+                    state=SAGEState.DESIGN_TEST.value,
+                    hypothesis_id=hypothesis.id,
+                    response_length=len(llm_output),
+                )
             
             # 3. 验证输出
             is_valid, error_msg = self.output_validator.validate(SAGEState.DESIGN_TEST, llm_output)
@@ -389,7 +526,13 @@ class SAGEController:
             if "[TOOL] model.run" in llm_output:
                 test_prompt = self._extract_test_prompt_from_design(llm_output)
                 if test_prompt:
-                    self._execute_test_immediately(test_prompt, hypothesis_id=hypothesis.id)
+                    design_info = self.output_validator.extract_test_design(llm_output)
+                    expected = design_info.get("expected", "Unknown")
+                    self._execute_test_immediately(
+                        test_prompt,
+                        hypothesis_id=hypothesis.id,
+                        expected=expected,
+                    )
             
             # 6. 更新假设状态为ANALYZE_RESULT
             hypothesis.current_state = SAGEState.ANALYZE_RESULT
@@ -430,6 +573,12 @@ class SAGEController:
             self.state_machine.state = SAGEState.ANALYZE_RESULT
             prompt = self.prompt_generator.generate()
             self.state_machine.state = old_state  # Restore state
+            self._record_action(
+                "prompt_generated",
+                state=SAGEState.ANALYZE_RESULT.value,
+                hypothesis_id=hypothesis.id,
+                prompt_length=len(prompt),
+            )
 
             if self.debug:
                 print(f"   Generated prompt ({len(prompt)} chars)")
@@ -442,6 +591,12 @@ class SAGEController:
             # 2. 调用LLM分析结果（添加假设标识到prompt，避免混淆）
             prompt_with_id = f"[ANALYZING HYPOTHESIS {hypothesis.id} ONLY]\n{prompt}"
             llm_output = self._get_llm_response_with_retry(prompt_with_id)
+            self._record_action(
+                "llm_response",
+                state=SAGEState.ANALYZE_RESULT.value,
+                hypothesis_id=hypothesis.id,
+                response_length=len(llm_output),
+            )
             
             # 3. 验证输出
             is_valid, error_msg = self.output_validator.validate(SAGEState.ANALYZE_RESULT, llm_output)
@@ -458,6 +613,55 @@ class SAGEController:
             
             # 4. 处理输出
             self._process_output(SAGEState.ANALYZE_RESULT, llm_output)
+
+            # SHES-OCRS checkpoint: once the observed test evidence has stopped
+            # moving, commit before the normal update step can terminalize the
+            # same hypothesis and hide a valid stagnation event.
+            if getattr(self.variant_config, "enable_shes", False):
+                self._record_action(
+                    "shes_pre_update_checkpoint",
+                    hypothesis_id=hypothesis.id,
+                    active_hypotheses=self._shes_active_checkpoint_rows(),
+                    hypothesis_test_count=len(hypothesis.test_history),
+                    global_test_count=len(self.state_machine.test_history),
+                    steering_calls_used=getattr(
+                        self.state_machine, "steering_calls_used", 0,
+                    ),
+                    dynamic_steer_attempts=getattr(
+                        self.state_machine, "dynamic_steer_attempts", 0,
+                    ),
+                )
+                handled_by_ocrs = self._sage_causal_maybe_run_ocrs(
+                    hypothesis,
+                    parsed_status=None,
+                    count_refined_streak=False,
+                )
+                if handled_by_ocrs:
+                    self._record_action(
+                        "shes_pre_update_ocrs_handled",
+                        hypothesis_id=hypothesis.id,
+                        status=hypothesis.status,
+                        current_state=(
+                            hypothesis.current_state.value
+                            if hypothesis.current_state is not None
+                            else None
+                        ),
+                        ocrs_outcome=getattr(hypothesis, "ocrs_outcome", None),
+                        hypothesis_test_count=len(hypothesis.test_history),
+                        global_test_count=len(self.state_machine.test_history),
+                        steering_calls_used=getattr(
+                            self.state_machine, "steering_calls_used", 0,
+                        ),
+                        dynamic_steer_attempts=getattr(
+                            self.state_machine, "dynamic_steer_attempts", 0,
+                        ),
+                    )
+                    if self.debug:
+                        print(
+                            f"   🧪 H{hypothesis.id} handled by SHES-OCRS "
+                            "before UPDATE_HYPOTHESIS"
+                        )
+                    return
             
             # 5. 更新假设状态为UPDATE_HYPOTHESIS
             hypothesis.current_state = SAGEState.UPDATE_HYPOTHESIS
@@ -488,6 +692,12 @@ class SAGEController:
             self.state_machine.state = SAGEState.UPDATE_HYPOTHESIS
             prompt = self.prompt_generator.generate()
             self.state_machine.state = old_state  # Restore state
+            self._record_action(
+                "prompt_generated",
+                state=SAGEState.UPDATE_HYPOTHESIS.value,
+                hypothesis_id=hypothesis.id,
+                prompt_length=len(prompt),
+            )
 
             if self.debug:
                 print(f"   Generated prompt ({len(prompt)} chars)")
@@ -495,6 +705,12 @@ class SAGEController:
             # 2. 调用LLM更新假设（添加假设标识，避免混淆）
             prompt_with_id = f"[UPDATING HYPOTHESIS {hypothesis.id} ONLY]\n{prompt}"
             llm_output = self._get_llm_response_with_retry(prompt_with_id)
+            self._record_action(
+                "llm_response",
+                state=SAGEState.UPDATE_HYPOTHESIS.value,
+                hypothesis_id=hypothesis.id,
+                response_length=len(llm_output),
+            )
             
             # 3. 验证输出
             is_valid, error_msg = self.output_validator.validate(SAGEState.UPDATE_HYPOTHESIS, llm_output)
@@ -514,26 +730,31 @@ class SAGEController:
             
             # 5. 解析假设更新，确定下一个状态
             hypothesis_updates = self._parse_hypothesis_updates(llm_output)
+            parsed_status: Optional[str] = None
             for hyp_update in hypothesis_updates:
                 if hyp_update.get("hypothesis_id") == hypothesis.id:
-                    status = hyp_update.get("status")
-                    if status in ["CONFIRMED", "REFUTED"]:
+                    parsed_status = hyp_update.get("status")
+                    if parsed_status in ["CONFIRMED", "REFUTED"]:
                         # 假设已完成，清除current_state
                         hypothesis.current_state = None
                         if self.debug:
-                            print(f"   ✅ H{hypothesis.id} {status}, stopping cycle")
+                            print(f"   ✅ H{hypothesis.id} {parsed_status}, stopping cycle")
                     else:
                         # Continue测试，回到DESIGN_TEST
                         hypothesis.current_state = SAGEState.DESIGN_TEST
                         if self.debug:
-                            print(f"   ✅ H{hypothesis.id} {status}, continuing to DESIGN_TEST")
+                            print(f"   ✅ H{hypothesis.id} {parsed_status}, continuing to DESIGN_TEST")
                     break
             else:
                 # If没有找到更新，默认继续测试
                 hypothesis.current_state = SAGEState.DESIGN_TEST
                 if self.debug:
                     print(f"   ⚠️  No update found for H{hypothesis.id}, defaulting to DESIGN_TEST")
-        
+
+            # SAGE-Causal OCRS: detect refine spin and force a causal-evidence-grounded close.
+            self._sage_causal_maybe_run_ocrs(hypothesis, parsed_status)
+            self._sage_causal_maybe_exit_for_global_steering(hypothesis, parsed_status)
+
         finally:
             # Restore之前的current_hypothesis_id
             self.state_machine.current_hypothesis_id = old_current_id
@@ -565,7 +786,11 @@ class SAGEController:
             # Extract测试prompt并执行
             test_prompt = self._extract_test_prompt_from_design(llm_output)
             if test_prompt:
-                self._execute_test_immediately(test_prompt)
+                design_info = self.output_validator.extract_test_design(llm_output)
+                self._execute_test_immediately(
+                    test_prompt,
+                    expected=design_info.get("expected", "Unknown"),
+                )
         
         # 6. 状态转换到ANALYZE_RESULT
         self.state_machine.transition(SAGEState.ANALYZE_RESULT)
@@ -596,7 +821,12 @@ class SAGEController:
             return match2.group(1)
         return None
     
-    def _execute_test_immediately(self, test_prompt: str, hypothesis_id: Optional[int] = None):
+    def _execute_test_immediately(
+        self,
+        test_prompt: str,
+        hypothesis_id: Optional[int] = None,
+        expected: str = "Unknown",
+    ):
         """立即执行测试"""
         if self.debug:
             print(f"🧪 Executing test: {test_prompt[:100]}...")
@@ -614,13 +844,24 @@ class SAGEController:
         # 转义prompt中的单引号，以便在命令字符串中正确使用
         escaped_prompt = test_prompt.replace("'", "\\'")
         execution_output = self.experiment_env.execute_experiment(f"[TOOL] model.run prompt='{escaped_prompt}'")
+        self._record_action(
+            "tool_call",
+            state=SAGEState.RUN_TEST.value,
+            tool="model.run",
+            hypothesis_id=hypothesis_id,
+            prompt=test_prompt,
+        )
         
         if self.debug:
             print(f"📈 Test execution result:")
             print(execution_output)
         
         # Parse测试结果（传入正确的hypothesis_id）
-        test_result = self._parse_test_result(execution_output, hypothesis_id=hypothesis_id)
+        test_result = self._parse_test_result(
+            execution_output,
+            hypothesis_id=hypothesis_id,
+            expected=expected,
+        )
         if test_result:
             # 存储测试结果（add_test_result会自动添加到假设的测试历史）
             self.state_machine.add_test_result(
@@ -631,6 +872,8 @@ class SAGEController:
                 normalized_activation=test_result.normalized_activation,
                 result=test_result.result
             )
+            test_result = self.state_machine.test_history[-1]
+            self._shes_record_test_score(test_result)
             
             # Save完整的测试执行输出到假设对象（用于ANALYZE_RESULT）
             hypothesis = self.state_machine.get_hypothesis_by_id(hypothesis_id)
@@ -644,6 +887,13 @@ class SAGEController:
             if self.debug:
                 print(f"📊 Parsed test result: prompt='{test_result.prompt}', activation={test_result.actual_activation}, hypothesis_id={test_result.hypothesis_id}")
                 print(f"   ✅ Test execution output saved and added to tools log for H{hypothesis_id}")
+            self._record_action(
+                "activation_result",
+                hypothesis_id=hypothesis_id,
+                prompt=test_result.prompt,
+                activation=test_result.actual_activation,
+                result=test_result.result,
+            )
     
     def _parse_exemplars_from_output(self, tool_output: str) -> List:
         """从工具输出中解析exemplars数据"""
@@ -712,7 +962,7 @@ class SAGEController:
                             print(f"⚠️  Error parsing tokens: {e}")
         
         return exemplars
-    
+
     def _get_llm_response_with_retry(self, prompt: str, max_retries: int = 3) -> str:
         """获取LLM响应，带重试机制和上下文压缩
 
@@ -881,6 +1131,19 @@ Please provide output again following the required format.
         # According to当前状态生成默认响应
         fallback_response = self._generate_fallback_response()
         self._process_output(self.state_machine.state, fallback_response)
+
+        if (
+            self.state_machine.state == SAGEState.ANALYZE_EXEMPLARS
+            and self.variant_config.max_initial_hypotheses > 0
+            and not self.state_machine.hypotheses
+        ):
+            self.error_reason = "no_hypotheses_after_analyze_exemplars"
+            self.error_detail = (
+                "ANALYZE_EXEMPLARS validation failed and fallback did not "
+                "produce parseable hypotheses."
+            )
+            self._force_conclude()
+            return
         
         # Force状态转换，避免无限循环
         try:
@@ -904,12 +1167,14 @@ Please provide output again following the required format.
         elif current_state == SAGEState.ANALYZE_EXEMPLARS:
             return """
 OBSERVATION:
-- Pattern 1: [Analysis needed]
-- Pattern 2: [Analysis needed]
-- Common elements: [Analysis needed]
+- Pattern 1: The exemplar evidence could not be parsed reliably after repeated validation failures.
+- Pattern 2: Additional active testing is needed before making a specific feature claim.
+- Common elements: The feature requires systematic follow-up tests based on corpus activations.
 
-PRELIMINARY HYPOTHESIS:
-This feature requires further analysis.
+[HYPOTHESIS LIST]:
+Hypothesis_1: This feature responds to a recurring token or token pattern in the top activating corpus examples.
+Hypothesis_2: This feature may depend on surrounding context rather than only the highest activating token itself.
+Hypothesis_3: Negative control texts without the observed corpus token pattern should show low activation.
 """
         
         elif current_state == SAGEState.FORM_HYPOTHESIS:
@@ -1005,10 +1270,13 @@ This feature requires further investigation due to insufficient data.
             if self.debug:
                 print(f"💡 Parsing hypotheses from Round 2 analysis:")
             hypotheses = self.output_validator.extract_hypotheses(output)
+            if self.variant_config.max_initial_hypotheses > 0:
+                hypotheses = hypotheses[: self.variant_config.max_initial_hypotheses]
             for hyp in hypotheses:
                 self.state_machine.add_hypothesis(hyp["text"])
                 if self.debug:
                     print(f"   Added hypothesis: {hyp['text']}")
+                self._record_action("hypothesis_added", hypothesis_text=hyp["text"])
         
         elif state == SAGEState.FORM_HYPOTHESIS:
             # Parse假设
@@ -1016,6 +1284,8 @@ This feature requires further investigation due to insufficient data.
                 print(f"💡 Hypothesis formation:")
                 print(output)
             hypotheses = self.output_validator.extract_hypotheses(output)
+            if self.variant_config.max_initial_hypotheses > 0:
+                hypotheses = hypotheses[: self.variant_config.max_initial_hypotheses]
             for hyp in hypotheses:
                 self.state_machine.add_hypothesis(hyp["text"])
                 if self.debug:
@@ -1040,7 +1310,12 @@ This feature requires further investigation due to insufficient data.
                         hypothesis_id = current_hypothesis.id if current_hypothesis else 1
                         
                         # Parse测试结果（传入正确的hypothesis_id）
-                        test_result = self._parse_test_result(execution_output, hypothesis_id=hypothesis_id)
+                        design_info = self.output_validator.extract_test_design(output)
+                        test_result = self._parse_test_result(
+                            execution_output,
+                            hypothesis_id=hypothesis_id,
+                            expected=design_info.get("expected", "Unknown"),
+                        )
                         if test_result:
                             # 使用add_test_result确保添加到假设的测试历史
                             self.state_machine.add_test_result(
@@ -1051,6 +1326,8 @@ This feature requires further investigation due to insufficient data.
                                 normalized_activation=test_result.normalized_activation,
                                 result=test_result.result
                             )
+                            test_result = self.state_machine.test_history[-1]
+                            self._shes_record_test_score(test_result)
                         
                         # 简化输出传递给LLM
                         simplified_output = self._simplify_test_output(execution_output)
@@ -1080,6 +1357,13 @@ This feature requires further investigation due to insufficient data.
                 self.state_machine.update_hypothesis(
                     hypothesis_id,
                     analysis_result["status"]
+                )
+                self._record_action(
+                    "hypothesis_status_update",
+                    state=state.value,
+                    hypothesis_id=hypothesis_id,
+                    status=analysis_result["status"],
+                    refined=False,
                 )
         
         elif state == SAGEState.UPDATE_HYPOTHESIS:
@@ -1111,6 +1395,14 @@ This feature requires further investigation due to insufficient data.
                 hyp_id = hyp_update.get("hypothesis_id")
                 status = hyp_update.get("status")
                 refined_text = hyp_update.get("refined_text")
+                if status == "REFINED" and not self.variant_config.allow_refinement:
+                    refined_text = None
+                    status = "UNCHANGED"
+                    self._record_action(
+                        "variant_blocked_refinement",
+                        hypothesis_id=hyp_id,
+                        variant=self.experiment_variant,
+                    )
                 
                 # In ... mode，优先使用current_hypothesis_id
                 if not hyp_id and hypothesis_id:
@@ -1121,6 +1413,13 @@ This feature requires further investigation due to insufficient data.
                         hyp_id,
                         status,
                         refined_text
+                    )
+                    self._record_action(
+                        "hypothesis_status_update",
+                        state=state.value,
+                        hypothesis_id=hyp_id,
+                        status=status,
+                        refined=bool(refined_text),
                     )
                     if self.debug:
                         print(f"   Updated hypothesis {hyp_id}: {status}")
@@ -1160,6 +1459,8 @@ This feature requires further investigation due to insufficient data.
         
         elif state == SAGEState.FINAL_CONCLUSION:
             # Save最终结论
+            if self.variant_config.output_aware:
+                self._capture_output_aware_note()
             self.state_machine.add_analysis(output)
     
     def _parse_exemplars(self, execution_output: str):
@@ -1174,7 +1475,12 @@ This feature requires further investigation due to insufficient data.
             if self.debug:
                 print("⚠️  No exemplars parsed from execution output")
     
-    def _parse_test_result(self, execution_output: str, hypothesis_id: int = 1):
+    def _parse_test_result(
+        self,
+        execution_output: str,
+        hypothesis_id: int = 1,
+        expected: str = "Unknown",
+    ):
         """解析测试结果"""
         # Parse真实的测试结果
         try:
@@ -1212,7 +1518,7 @@ This feature requires further investigation due to insufficient data.
                 id=len(self.state_machine.test_history) + 1,
                 hypothesis_id=hypothesis_id,  # 使用传入的假设ID
                 prompt=prompt,
-                expected="Unknown",  # 需要从设计阶段获取
+                expected=expected,
                 actual_activation=actual_activation,
                 normalized_activation=actual_activation,  # 简化处理
                 result="INCONCLUSIVE",  # 需要根据激活值判断
@@ -1234,7 +1540,7 @@ This feature requires further investigation due to insufficient data.
                 id=len(self.state_machine.test_history) + 1,
                 hypothesis_id=hypothesis_id,
                 prompt="parsing_failed",
-                expected="Unknown",
+                expected=expected,
                 actual_activation=0.0,
                 normalized_activation=0.0,
                 result="ERROR",
@@ -1253,6 +1559,8 @@ This feature requires further investigation due to insufficient data.
             return SAGEState.ANALYZE_EXEMPLARS
         
         if current == SAGEState.ANALYZE_EXEMPLARS:
+            if self.variant_config.direct_to_final_after_hypotheses:
+                return SAGEState.FINAL_CONCLUSION
             # 进入并行假设测试
             return SAGEState.PARALLEL_HYPOTHESIS_TESTING
         
@@ -1261,6 +1569,11 @@ This feature requires further investigation due to insufficient data.
             return SAGEState.PARALLEL_HYPOTHESIS_TESTING
         
         if current == SAGEState.PARALLEL_HYPOTHESIS_TESTING:
+            if (
+                getattr(self.variant_config, "enable_global_steering_synthesis", False)
+                and getattr(self.state_machine, "global_steering_triggered", False)
+            ):
+                return SAGEState.FINAL_CONCLUSION
             # In ... mode，检查是否所有假设都已完成
             if self.state_machine.all_hypotheses_finalized():
                 return SAGEState.REVIEW_ALL_HYPOTHESES
@@ -1497,20 +1810,88 @@ This feature requires further investigation due to insufficient data.
         duration = 0
         if self.execution_stats["start_time"] and self.execution_stats["end_time"]:
             duration = self.execution_stats["end_time"] - self.execution_stats["start_time"]
-        
+
+        sage_causal_summary = {
+            "triage_path": getattr(self.state_machine, "triage_path", None),
+            "triage_signals": getattr(self.state_machine, "triage_signals", {}),
+            "ocrs_triggered": getattr(self.state_machine, "ocrs_triggered", False),
+            "ocrs_label": getattr(self.state_machine, "ocrs_label", None),
+            "ocrs_trigger_reason": getattr(self.state_machine, "ocrs_trigger_reason", None),
+            "steering_calls_used": getattr(self.state_machine, "steering_calls_used", 0),
+            "steering_calls_log": getattr(self.state_machine, "steering_calls_log", []),
+            "dynamic_steer_attempts": getattr(
+                self.state_machine, "dynamic_steer_attempts", 0,
+            ),
+            "dynamic_steer_fallbacks": getattr(
+                self.state_machine, "dynamic_steer_fallbacks", 0,
+            ),
+            "logit_lens_available": getattr(self.state_machine, "logit_lens_data", None) is not None,
+            "global_steering_triggered": getattr(
+                self.state_machine, "global_steering_triggered", False,
+            ),
+            "global_steering_reason": getattr(
+                self.state_machine, "global_steering_reason", None,
+            ),
+            "global_steering_prompts": getattr(
+                self.state_machine, "global_steering_prompts", [],
+            ),
+            "global_steering_evidence": getattr(
+                self.state_machine, "global_steering_evidence", [],
+            ),
+            "shes": {
+                "enabled": getattr(self.state_machine, "shes_enabled", False),
+                "threshold": getattr(self.state_machine, "shes_threshold", None),
+                "threshold_factor": getattr(
+                    self.state_machine, "shes_threshold_factor", None,
+                ),
+                "window": getattr(self.state_machine, "shes_window", None),
+                "epsilon": getattr(self.state_machine, "shes_epsilon", None),
+                "min_tests": getattr(self.state_machine, "shes_min_tests", None),
+                "triggered": getattr(self.state_machine, "shes_triggered", False),
+                "trigger_reason": getattr(self.state_machine, "shes_trigger_reason", None),
+                "events": getattr(self.state_machine, "shes_events", []),
+            },
+            "steering_prior_data": getattr(
+                self.state_machine, "steering_prior_data", None,
+            ),
+            "one_shot_description": getattr(
+                self.variant_config, "one_shot_description", False,
+            ),
+        }
+
         return {
+            "status": (
+                "error"
+                if self.error_reason
+                else "skipped" if self.state_machine.skip_reason else "completed"
+            ),
+            "error_reason": self.error_reason,
+            "error_detail": self.error_detail,
+            "skip_reason": getattr(self.state_machine, "skip_reason", None),
+            "skip_detail": getattr(self.state_machine, "skip_detail", None),
+            "experiment_variant": self.experiment_variant,
+            "variant_config": self.variant_config.to_dict(),
+            "feature_spec": self.feature_spec,
+            "random_seed": self.random_seed,
             "feature_id": self.feature_id,
             "layer": self.layer,
             "final_state": self.state_machine.state.value,
             "total_rounds": self.state_machine.round,
             "execution_stats": self.execution_stats,
             "duration_seconds": duration,
+            "sage_causal": sage_causal_summary,
             "hypotheses": [
                 {
                     "id": h.id,
                     "text": h.text,
                     "status": h.status,
-                    "confidence": h.confidence
+                    "confidence": h.confidence,
+                    "ocrs_outcome": getattr(h, "ocrs_outcome", None),
+                    "refined_streak": getattr(h, "refined_streak", 0),
+                    "evidence_score": getattr(h, "evidence_score", 0.0),
+                    "evidence_score_history": getattr(
+                        h, "evidence_score_history", [],
+                    ),
                 }
                 for h in self.state_machine.hypotheses
             ],
@@ -1524,6 +1905,10 @@ This feature requires further investigation due to insufficient data.
                 }
                 for t in self.state_machine.test_history
             ],
+            "agent_actions": self.agent_actions,
+            "failure_mode": self._infer_failure_mode(),
+            "output_audit": self.output_audit,
+            "experiment_trace": self._build_experiment_trace(),
             "analysis_history": self.state_machine.analysis_history,
             "state_info": self.state_machine.get_state_info()
         }
@@ -1576,6 +1961,1266 @@ This feature requires further investigation due to insufficient data.
                 unique_tests.append(test)
 
         return unique_tests
+
+    def _record_action(self, action: str, **kwargs):
+        """Record a compact agent/tool action for audit traces."""
+        item = {
+            "idx": len(self.agent_actions) + 1,
+            "round": self.state_machine.round,
+            "action": action,
+            "timestamp": time.time(),
+        }
+        item.update(kwargs)
+        self.agent_actions.append(item)
+
+    def _generate_variant_test_design(self, hypothesis: Hypothesis) -> str:
+        """Generate a deterministic non-targeted test for random_test ablations."""
+        candidates = []
+        if self.state_machine.exemplars:
+            candidates.extend(ex.text for ex in self.state_machine.exemplars if getattr(ex, "text", ""))
+        candidates.extend([
+            "The quick brown fox jumps over the lazy dog.",
+            "This sentence is a neutral control example.",
+            "A short paragraph describes an ordinary event.",
+            "Numbers like 123 and punctuation appear here.",
+        ])
+        prompt = self.rng.choice(candidates) if candidates else "This is a neutral control sentence."
+        prompt = " ".join(prompt.replace("\n", " ").split())
+        if len(prompt) > 180:
+            prompt = prompt[:180].rsplit(" ", 1)[0]
+        escaped = prompt.replace("'", "\\'")
+        return (
+            f"TESTING HYPOTHESIS: Non-targeted diagnostic probe for H{hypothesis.id}\n"
+            f"[TOOL] model.run prompt='{escaped}'\n"
+            "EXPECTED: Unknown activation; this ablation tests whether targeted test design is necessary."
+        )
+
+    # =========================================================================
+    # SAGE-Causal hooks (no new states; deterministic side-channel decisions)
+    # =========================================================================
+
+    def _sage_causal_apply_triage(self) -> None:
+        """Compute logit-lens prior + composite-agreement triage path.
+
+        Runs once after exemplars are loaded. Populates state_machine.logit_lens_data,
+        state_machine.triage_path, and state_machine.triage_signals so prompt_generator
+        can inject them into ANALYZE_EXEMPLARS. Silently no-ops when variant flags
+        don't enable it or the Neuronpedia source isn't known.
+        """
+        if not (self.variant_config.enable_logit_lens or self.variant_config.enable_triage):
+            return
+        if not _SAGE_CAUSAL_AVAILABLE:
+            self._record_action(
+                "sage_causal_skip", reason=f"import_failed: {_SAGE_CAUSAL_IMPORT_ERROR}"
+            )
+            return
+
+        model = self.feature_spec.get("neuronpedia_model_id")
+        source = self.feature_spec.get("source")
+        feature_index = self.feature_spec.get("feature_index", self.feature_id)
+        if not model or not source:
+            self._record_action(
+                "sage_causal_skip",
+                reason="missing_neuronpedia_model_or_source",
+                feature_spec=self.feature_spec,
+            )
+            return
+
+        try:
+            lens = _sc_get_logit_lens(model, source, int(feature_index), top_k=20)
+        except Exception as exc:
+            self._record_action("sage_causal_skip", reason=f"logit_lens_failed: {exc}")
+            return
+
+        self.state_machine.logit_lens_data = {
+            "model": lens.model,
+            "source": lens.source,
+            "feature_index": lens.feature_index,
+            "pos_tokens": lens.pos_tokens,
+            "pos_values": lens.pos_values,
+            "neg_tokens": lens.neg_tokens,
+            "neg_values": lens.neg_values,
+        }
+
+        if not self.variant_config.enable_triage:
+            return
+
+        t_in = self._sage_causal_top_exemplar_tokens(top_k=20)
+        agreement_result = _sc_compute_agreement(t_in, lens.pos_tokens, lens.neg_tokens)
+        entropy_norm = self._sage_causal_normalized_entropy(
+            lens.pos_values + lens.neg_values, k=len(lens.pos_values) + len(lens.neg_values)
+        )
+        path = _sc_select_path(agreement_result.agreement, entropy_norm)
+
+        self.state_machine.triage_path = path
+        self.state_machine.triage_signals = {
+            "agreement": agreement_result.agreement,
+            "direction": agreement_result.direction,
+            "pos_score": agreement_result.pos_score,
+            "neg_score": agreement_result.neg_score,
+            "components": agreement_result.components,
+            "out_entropy": entropy_norm,
+            "t_in_sample": t_in[:10],
+        }
+        self._record_action(
+            "sage_causal_triage",
+            path=path,
+            agreement=agreement_result.agreement,
+            direction=agreement_result.direction,
+            out_entropy=entropy_norm,
+        )
+        if self.debug:
+            print(
+                f"🧭 SAGE-Causal triage: path={path} "
+                f"agreement={agreement_result.agreement:.3f} "
+                f"direction={agreement_result.direction} "
+                f"out_entropy={entropy_norm:.3f}"
+            )
+
+    def _sage_causal_maybe_exit_for_global_steering(
+        self, hypothesis: Hypothesis, parsed_status: Optional[str]
+    ) -> None:
+        """Exit local refinement and collect global steering facts."""
+        if not getattr(self.variant_config, "enable_global_steering_synthesis", False):
+            return
+        if getattr(self.state_machine, "global_steering_triggered", False):
+            return
+        if hypothesis.current_state is None:
+            hypothesis.refined_streak = 0
+            return
+
+        if parsed_status in ("REFINED", "UNCHANGED", None):
+            hypothesis.refined_streak += 1
+        else:
+            hypothesis.refined_streak = 0
+
+        trigger = self._sage_causal_check_global_steering_trigger(hypothesis)
+        if trigger is None:
+            return
+
+        self._sage_causal_maybe_collect_global_steering(trigger)
+        for candidate in self.state_machine.get_active_hypotheses():
+            candidate.current_state = None
+            if candidate.status == "PENDING":
+                candidate.status = "UNCHANGED"
+        self.state_machine.current_hypothesis_id = None
+        if self.debug:
+            print(
+                "🧪 Global steering synthesis triggered; exiting local refine "
+                f"loop ({trigger})"
+            )
+
+    def _sage_causal_check_global_steering_trigger(
+        self, hypothesis: Hypothesis
+    ) -> Optional[str]:
+        """Return why final-stage global steering should take over."""
+        if hypothesis.refined_streak >= 2:
+            return f"refined_streak_>=2_h{hypothesis.id}"
+        if len(hypothesis.test_history) >= 3 and hypothesis.status not in ("CONFIRMED", "REFUTED"):
+            return f"tests_>=3_unresolved_h{hypothesis.id}"
+        partial = [
+            h for h in self.state_machine.hypotheses
+            if h.status in ("REFINED", "UNCHANGED", "PENDING") and len(h.test_history) >= 1
+        ]
+        if len(partial) >= 2:
+            return f"polysemantic_suspect({len(partial)}_partial)"
+        if self.state_machine.round >= max(8, self.state_machine.max_rounds - 3):
+            active = [
+                h for h in self.state_machine.hypotheses
+                if h.status not in ("CONFIRMED", "REFUTED")
+            ]
+            if active:
+                return f"late_round_{self.state_machine.round}_active_hypotheses"
+        return None
+
+    def _sage_causal_maybe_collect_global_steering(self, reason: str) -> None:
+        """Collect multi-prompt steering continuations for final synthesis."""
+        if not getattr(self.variant_config, "enable_global_steering_synthesis", False):
+            return
+        if getattr(self.state_machine, "global_steering_evidence", None):
+            return
+        if not _SAGE_CAUSAL_AVAILABLE:
+            self._record_action(
+                "sage_causal_global_steering_skip",
+                reason=f"import_failed: {_SAGE_CAUSAL_IMPORT_ERROR}",
+            )
+            return
+
+        model = self.feature_spec.get("neuronpedia_model_id")
+        source = self.feature_spec.get("source")
+        feature_index = self.feature_spec.get("feature_index", self.feature_id)
+        if not model or not source:
+            self._record_action(
+                "sage_causal_global_steering_skip",
+                reason="missing_neuronpedia_model_or_source",
+                feature_spec=self.feature_spec,
+            )
+            return
+
+        prompts = self._sage_causal_global_steering_prompts()
+        evidence: List[Dict[str, Any]] = []
+        for prompt in prompts:
+            try:
+                result = _sc_steer_feature(
+                    model,
+                    source,
+                    int(feature_index),
+                    prompt=prompt,
+                    strength=8.0,
+                    n_tokens=40,
+                    seed=16,
+                )
+            except Exception as exc:
+                self._record_action(
+                    "sage_causal_global_steering_failed",
+                    prompt=prompt,
+                    error=str(exc),
+                )
+                continue
+            self.state_machine.steering_calls_used += 1
+            evidence.append({
+                "source": "neutral_prompt_steering",
+                "prompt": prompt,
+                "strength": result.strength,
+                "n_tokens": 40,
+                "default_text": result.default_text,
+                "steered_text": result.steered_text,
+                "boosted_any_position": result.boosted_tokens_any_position,
+                "suppressed_any_position": result.suppressed_tokens_any_position,
+            })
+
+        self.state_machine.global_steering_triggered = True
+        self.state_machine.global_steering_reason = reason
+        self.state_machine.global_steering_prompts = prompts
+        self.state_machine.global_steering_evidence = evidence
+        self._record_action(
+            "sage_causal_global_steering_collected",
+            reason=reason,
+            prompts=prompts,
+            evidence_count=len(evidence),
+        )
+
+    def _sage_causal_global_steering_prompts(self) -> List[str]:
+        """Neutral prompts for feature-level causal generation probes."""
+        return [
+            "Please write a story about",
+            "I was thinking that",
+            "The concept is",
+        ]
+
+    def _sage_causal_apply_steering_prior(self) -> None:
+        """Ablation 5: pre-fetch a one-shot steering result and stash it in the
+        state machine so prompt_generator can render it next to the lens prior."""
+        if not getattr(self.variant_config, "enable_steering_prior", False):
+            return
+        if not _SAGE_CAUSAL_AVAILABLE:
+            return
+        model = self.feature_spec.get("neuronpedia_model_id")
+        source = self.feature_spec.get("source")
+        feature_index = self.feature_spec.get("feature_index", self.feature_id)
+        if not model or not source:
+            return
+
+        exemplar_dicts = [
+            {
+                "tokens": getattr(ex, "tokens", []) or [],
+                "per_token_activations": getattr(ex, "per_token_activations", []) or [],
+                "max_activation": getattr(ex, "activation", 0.0),
+            }
+            for ex in (self.state_machine.exemplars or [])
+        ]
+        prompt = _sc_select_prompt(exemplar_dicts) or "The"
+        try:
+            result = _sc_steer_feature(
+                model, source, int(feature_index),
+                prompt=prompt, strength=8.0, n_tokens=8,
+            )
+        except Exception as exc:
+            self._record_action(
+                "sage_causal_steering_prior_failed",
+                error=str(exc),
+            )
+            return
+
+        self.state_machine.steering_calls_used += 1
+        self.state_machine.steering_prior_data = {
+            "prompt": prompt,
+            "strength": result.strength,
+            "default_text": result.default_text,
+            "steered_text": result.steered_text,
+            "boosted_any_position": result.boosted_tokens_any_position,
+            "suppressed_any_position": result.suppressed_tokens_any_position,
+        }
+        self._record_action(
+            "sage_causal_steering_prior",
+            prompt=prompt,
+            n_boosted=len(result.boosted_tokens_any_position or []),
+            n_suppressed=len(result.suppressed_tokens_any_position or []),
+        )
+
+    def _sage_causal_top_exemplar_tokens(self, top_k: int = 20) -> List[str]:
+        """Top tokens by mean per-token activation across the cached exemplars."""
+        tok_acts: Dict[str, List[float]] = defaultdict(list)
+        for ex in self.state_machine.exemplars or []:
+            tokens = getattr(ex, "tokens", []) or []
+            acts = getattr(ex, "per_token_activations", []) or []
+            for tok, act in zip(tokens, acts):
+                if act > 0:
+                    tok_acts[tok].append(act)
+        ranked = sorted(
+            tok_acts.items(), key=lambda kv: -sum(kv[1]) / len(kv[1])
+        )
+        return [tok for tok, _ in ranked[:top_k]]
+
+    def _sage_causal_normalized_entropy(self, values: List[float], k: int) -> float:
+        if not values or k <= 1:
+            return 0.0
+        total = sum(abs(v) for v in values) or 1.0
+        probs = [abs(v) / total for v in values if v != 0]
+        if not probs:
+            return 0.0
+        h = -sum(p * math.log(p) for p in probs if p > 0)
+        return h / math.log(k) if math.log(k) > 0 else 0.0
+
+    def _maybe_skip_shes_no_positive_exemplars(self) -> bool:
+        """Skip SHES runs whose corpus exemplars have no positive activation."""
+        if not getattr(self.variant_config, "enable_shes", False):
+            return False
+        exemplars = self.state_machine.exemplars or []
+        if not exemplars:
+            return False
+        positive_activations = [
+            float(getattr(ex, "activation", 0.0) or 0.0)
+            for ex in exemplars
+            if float(getattr(ex, "activation", 0.0) or 0.0) > 0
+        ]
+        if positive_activations:
+            return False
+
+        detail = (
+            "GET_EXEMPLARS returned exemplar records, but none had positive "
+            "max activation. SHES threshold cannot be calibrated; skipping "
+            "this feature instead of using a fallback threshold."
+        )
+        self.state_machine.shes_enabled = False
+        self.state_machine.shes_threshold = None
+        self.state_machine.skip("no_positive_exemplars", detail)
+        self._record_action(
+            "feature_skipped",
+            reason="no_positive_exemplars",
+            detail=detail,
+            exemplar_count=len(exemplars),
+            max_activation=max(
+                float(getattr(ex, "activation", 0.0) or 0.0)
+                for ex in exemplars
+            ),
+        )
+        if self.debug:
+            print(f"⏭️  Skipping feature: {detail}")
+        return True
+
+    def _shes_initialize(self) -> None:
+        """Initialize SHES scoring parameters once exemplars are available."""
+        if not getattr(self.variant_config, "enable_shes", False):
+            return
+        activations = [
+            float(getattr(ex, "activation", 0.0) or 0.0)
+            for ex in (self.state_machine.exemplars or [])
+            if float(getattr(ex, "activation", 0.0) or 0.0) > 0
+        ]
+        if not activations:
+            raise ValueError(
+                "Cannot initialize SHES threshold without positive exemplar "
+                "activations. This feature should have been skipped after "
+                "GET_EXEMPLARS."
+            )
+        top_k = max(1, min(self.top_k, len(activations)))
+        top_values = sorted(activations, reverse=True)[:top_k]
+        mean_activation = sum(top_values) / len(top_values)
+
+        factor = float(getattr(self.variant_config, "shes_threshold_factor", 0.5))
+        threshold = max(mean_activation * factor, 1e-6)
+        self.state_machine.shes_enabled = True
+        self.state_machine.shes_threshold = threshold
+        self.state_machine.shes_threshold_factor = factor
+        self.state_machine.shes_window = int(getattr(self.variant_config, "shes_window", 2))
+        self.state_machine.shes_epsilon = float(getattr(self.variant_config, "shes_epsilon", 0.08))
+        self.state_machine.shes_min_tests = int(getattr(self.variant_config, "shes_min_tests", 2))
+        self._record_action(
+            "shes_initialized",
+            threshold=threshold,
+            threshold_factor=factor,
+            exemplar_mean=mean_activation,
+            window=self.state_machine.shes_window,
+            epsilon=self.state_machine.shes_epsilon,
+            min_tests=self.state_machine.shes_min_tests,
+        )
+
+    def _shes_record_test_score(self, test_result: TestResult) -> None:
+        """Update one hypothesis's SHES evidence score after an activation test."""
+        if not getattr(self.variant_config, "enable_shes", False):
+            return
+        hypothesis = self.state_machine.get_hypothesis_by_id(test_result.hypothesis_id)
+        if not hypothesis:
+            return
+        threshold = self.state_machine.shes_threshold
+        if threshold is None:
+            self._shes_initialize()
+            threshold = self.state_machine.shes_threshold
+        threshold = max(float(threshold or 1.0), 1e-6)
+
+        expected_direction = self._shes_expected_direction(test_result.expected)
+        raw_margin = (float(test_result.actual_activation) - threshold) / threshold
+        if expected_direction == "low":
+            support_margin = -raw_margin
+        elif expected_direction == "high":
+            support_margin = raw_margin
+        else:
+            support_margin = 0.0
+
+        clipped_margin = max(-1.0, min(1.0, support_margin))
+        if expected_direction in ("high", "low"):
+            test_result.result = "CONFIRMED" if support_margin >= 0 else "REFUTED"
+        previous_score = float(getattr(hypothesis, "evidence_score", 0.0))
+        previous_n = len(getattr(hypothesis, "evidence_score_history", []))
+        new_score = (previous_score * previous_n + clipped_margin) / (previous_n + 1)
+        hypothesis.evidence_score = new_score
+        event = {
+            "test_id": test_result.id,
+            "hypothesis_id": test_result.hypothesis_id,
+            "expected": test_result.expected,
+            "expected_direction": expected_direction,
+            "activation": test_result.actual_activation,
+            "threshold": threshold,
+            "raw_margin": raw_margin,
+            "support_margin": clipped_margin,
+            "score": new_score,
+            "round": self.state_machine.round,
+            "hypothesis_test_count": len(hypothesis.test_history),
+            "global_test_count": len(self.state_machine.test_history),
+            "active_hypothesis_count": len(self.state_machine.get_active_hypotheses()),
+        }
+        hypothesis.evidence_score_history.append(event)
+        self.state_machine.shes_events.append(event)
+        self._record_action("shes_score_update", **event)
+
+    @staticmethod
+    def _shes_expected_direction(expected: str) -> str:
+        text = (expected or "").lower()
+        high_match = re.search(
+            r"\b(high|positive|strong|activate|activation|fire)\b",
+            text,
+        )
+        low_match = re.search(
+            r"\b(low|negative|no activation|zero|silent|should not activate)\b",
+            text,
+        )
+        if high_match and low_match:
+            return "high" if high_match.start() <= low_match.start() else "low"
+        if low_match:
+            return "low"
+        if high_match:
+            return "high"
+        return "unknown"
+
+    def _shes_check_stagnation_trigger(self, hypothesis: Hypothesis) -> Optional[str]:
+        """Return a SHES trigger once the current hypothesis has stagnated."""
+        if not getattr(self.variant_config, "enable_shes", False):
+            return None
+        if getattr(hypothesis, "ocrs_outcome", None) is not None:
+            return None
+
+        window = max(2, int(getattr(self.state_machine, "shes_window", 2)))
+        epsilon = float(getattr(self.state_machine, "shes_epsilon", 0.08))
+        min_tests = max(window, int(getattr(self.state_machine, "shes_min_tests", 2)))
+        history = getattr(hypothesis, "evidence_score_history", [])
+        if len(history) < min_tests:
+            return None
+
+        recent = history[-window:]
+        scores = [float(item.get("score", 0.0)) for item in recent]
+        score_span = max(scores) - min(scores) if scores else 0.0
+        diagnostic = {
+            "hypothesis_id": hypothesis.id,
+            "tests": len(history),
+            "score": float(getattr(hypothesis, "evidence_score", 0.0)),
+            "recent_score_span": score_span,
+            "recent_scores": scores,
+        }
+        if score_span > epsilon:
+            return None
+
+        reason = (
+            f"shes_stagnation_per_hypothesis("
+            f"h={hypothesis.id},window={window},epsilon={epsilon:.3f})"
+        )
+        metrics = self._shes_trigger_metrics(
+            hypothesis=hypothesis,
+            reason=reason,
+            score_span=score_span,
+            recent_scores=scores,
+        )
+        self.state_machine.shes_triggered = True
+        self.state_machine.shes_trigger_reason = reason
+        self.state_machine.shes_events.append({
+            "event": "trigger",
+            **metrics,
+        })
+        self._record_action(
+            "shes_stagnation_detected",
+            hypothesis_id=hypothesis.id,
+            reason=reason,
+            policy="per_hypothesis",
+            diagnostics=[diagnostic],
+            **metrics,
+        )
+        return reason
+
+    def _shes_trigger_metrics(
+        self,
+        hypothesis: Hypothesis,
+        reason: str,
+        score_span: float,
+        recent_scores: List[float],
+    ) -> Dict[str, Any]:
+        """Return structured SHES trigger audit fields without affecting control flow."""
+        hypothesis_tests = len(getattr(hypothesis, "evidence_score_history", []) or [])
+        global_tests = len(self.state_machine.test_history)
+        return {
+            "trigger_reason": reason,
+            "trigger_round": self.state_machine.round,
+            "trigger_test_id": (
+                int(hypothesis.evidence_score_history[-1].get("test_id", 0))
+                if hypothesis.evidence_score_history else None
+            ),
+            "trigger_hypothesis_id": hypothesis.id,
+            "trigger_hypothesis_tests": hypothesis_tests,
+            "trigger_global_tests": global_tests,
+            "tests_before_trigger_hypothesis": max(0, hypothesis_tests - 1),
+            "tests_before_trigger_global": max(0, global_tests - 1),
+            "trigger_score": float(getattr(hypothesis, "evidence_score", 0.0)),
+            "trigger_recent_score_span": score_span,
+            "trigger_recent_scores": recent_scores,
+            "active_hypothesis_count": len(self.state_machine.get_active_hypotheses()),
+            "steering_calls_used_before_trigger": getattr(
+                self.state_machine, "steering_calls_used", 0,
+            ),
+            "steering_calls_budget": getattr(
+                self.state_machine, "steering_calls_budget", None,
+            ),
+            "dynamic_steer_attempts_before_trigger": getattr(
+                self.state_machine, "dynamic_steer_attempts", 0,
+            ),
+            "dynamic_steer_fallbacks_before_trigger": getattr(
+                self.state_machine, "dynamic_steer_fallbacks", 0,
+            ),
+        }
+
+    def _sage_causal_maybe_run_ocrs(
+        self,
+        hypothesis: Hypothesis,
+        parsed_status: Optional[str],
+        count_refined_streak: bool = True,
+    ) -> bool:
+        """Check OCRS/SHES triggers and return whether the hypothesis was handled.
+
+        If a trigger fires, inject output-side
+        causal evidence into the next UPDATE_HYPOTHESIS LLM pass. By default also
+        forces CONFIRMED/REFUTED and marks the hypothesis terminal; when
+        `enable_force_exit=False` the LLM's natural decision is honored and the
+        hypothesis stays in the inner loop (controlled by an ocrs_outcome guard
+        to prevent re-trigger)."""
+        if not self.variant_config.enable_ocrs:
+            return False
+        if (
+            not _SAGE_CAUSAL_AVAILABLE
+            and getattr(self.variant_config, "enable_ocrs_evidence", True)
+        ):
+            self._record_action(
+                "sage_causal_ocrs_skip",
+                hypothesis_id=hypothesis.id,
+                reason=f"import_failed: {_SAGE_CAUSAL_IMPORT_ERROR}",
+            )
+            return False
+        if hypothesis.current_state is None:
+            # Already terminal (CONFIRMED/REFUTED) — reset streak and exit.
+            hypothesis.refined_streak = 0
+            return False
+        # Guard against re-triggering OCRS on the same hypothesis. Matters most for
+        # the no_force_exit ablation, where the hypothesis can remain active after
+        # injection — without this we'd burn steering budget on identical evidence.
+        if hypothesis.ocrs_outcome is not None:
+            return False
+
+        if count_refined_streak:
+            if parsed_status in ("REFINED", "UNCHANGED", None):
+                hypothesis.refined_streak += 1
+            else:
+                hypothesis.refined_streak = 0
+
+        if getattr(self.variant_config, "enable_shes", False):
+            trigger = self._shes_check_stagnation_trigger(hypothesis)
+        else:
+            trigger = self._sage_causal_check_triggers(hypothesis)
+        if trigger is None:
+            return False
+
+        # Budget gate.
+        needs_steering_budget = (
+            getattr(self.variant_config, "enable_ocrs_evidence", True)
+            and getattr(self.variant_config, "enable_method_time_steering", True)
+        )
+        if (
+            needs_steering_budget
+            and self.state_machine.steering_calls_used >= self.state_machine.steering_calls_budget
+        ):
+            self._record_action(
+                "sage_causal_ocrs_skip",
+                hypothesis_id=hypothesis.id,
+                reason="steering_budget_exhausted",
+                trigger=trigger,
+            )
+            return False
+
+        if not getattr(self.variant_config, "enable_ocrs_evidence", True):
+            # Ablation 6: deliberately suppress the causal evidence content. The
+            # forced-exit prompt still runs but the OCRS block only names the
+            # trigger; no boost/suppress tokens are shown to the LLM.
+            evidence = {
+                "source": "withheld",
+                "prompt": None,
+                "strength": "n/a",
+                "default_text": "",
+                "steered_text": "",
+                "boosted_any_position": [],
+                "suppressed_any_position": [],
+                "trigger": trigger,
+                "ocrs_label_hint": "withheld",
+                "shes_snapshot": self._shes_snapshot(),
+            }
+        else:
+            evidence = self._sage_causal_fetch_ocrs_evidence(hypothesis, trigger)
+            if evidence is None:
+                return False
+
+        force_exit = self.variant_config.enable_force_exit
+        # Inject the evidence into a second UPDATE_HYPOTHESIS LLM pass.
+        # In force_exit mode the LLM is told to pick CONFIRMED/REFUTED; in
+        # no_force_exit mode the OCRS prompt block is advisory only and the LLM
+        # may keep REFINED/UNCHANGED so the inner loop continues.
+        self.state_machine.ocrs_evidence = evidence
+        self.state_machine.ocrs_trigger_reason = trigger
+        self.state_machine.ocrs_triggered = True
+        try:
+            old_state = self.state_machine.state
+            self.state_machine.state = SAGEState.UPDATE_HYPOTHESIS
+            prompt = self.prompt_generator.generate()
+            self.state_machine.state = old_state
+            self._record_action(
+                "sage_causal_ocrs_inject",
+                hypothesis_id=hypothesis.id,
+                trigger=trigger,
+                prompt_length=len(prompt),
+                force_exit=force_exit,
+                hypothesis_test_count=len(hypothesis.test_history),
+                global_test_count=len(self.state_machine.test_history),
+                steering_calls_used=getattr(
+                    self.state_machine, "steering_calls_used", 0,
+                ),
+                dynamic_steer_attempts=getattr(
+                    self.state_machine, "dynamic_steer_attempts", 0,
+                ),
+                dynamic_steer_fallbacks=getattr(
+                    self.state_machine, "dynamic_steer_fallbacks", 0,
+                ),
+            )
+            wrapper_tag = (
+                "OCRS FORCED CLOSURE" if force_exit else "OCRS EVIDENCE INJECTION"
+            )
+            forced_prompt = f"[{wrapper_tag} - HYPOTHESIS {hypothesis.id}]\n{prompt}"
+            llm_output = self._get_llm_response_with_retry(forced_prompt)
+            self._record_action(
+                "sage_causal_ocrs_response",
+                hypothesis_id=hypothesis.id,
+                response_length=len(llm_output),
+                trigger=trigger,
+                force_exit=force_exit,
+            )
+        finally:
+            # Clear so it doesn't leak into other hypotheses' prompts.
+            self.state_machine.ocrs_evidence = None
+
+        forced_updates = self._parse_hypothesis_updates(llm_output)
+        forced_status: Optional[str] = None
+        for upd in forced_updates:
+            if upd.get("hypothesis_id") == hypothesis.id:
+                forced_status = upd.get("status")
+                break
+
+        label_hint = evidence.get("ocrs_label_hint", "divergent")
+
+        if force_exit:
+            # Force a terminal status. Fall back to the steering-evidence-derived
+            # direction if the LLM didn't pick CONFIRMED/REFUTED. When evidence is
+            # deliberately withheld (ablation 6 / SHES commit), use the SHES score
+            # sign instead of biasing the experiment toward either terminal label.
+            if forced_status not in ("CONFIRMED", "REFUTED"):
+                if label_hint == "withheld":
+                    forced_status = (
+                        "CONFIRMED"
+                        if float(getattr(hypothesis, "evidence_score", 0.0)) >= 0
+                        else "REFUTED"
+                    )
+                else:
+                    forced_status = "REFUTED" if label_hint != "supported" else "CONFIRMED"
+                self._record_action(
+                    "sage_causal_ocrs_fallback_status",
+                    hypothesis_id=hypothesis.id,
+                    forced_status=forced_status,
+                )
+            label = "supported" if forced_status == "CONFIRMED" else label_hint
+            self.state_machine.update_hypothesis(hypothesis.id, forced_status)
+            self._record_action(
+                "hypothesis_status_update",
+                state="OCRS",
+                hypothesis_id=hypothesis.id,
+                status=forced_status,
+                refined=False,
+                trigger=trigger,
+                force_exit=True,
+                hypothesis_test_count=len(hypothesis.test_history),
+                global_test_count=len(self.state_machine.test_history),
+                steering_calls_used=getattr(
+                    self.state_machine, "steering_calls_used", 0,
+                ),
+                dynamic_steer_attempts=getattr(
+                    self.state_machine, "dynamic_steer_attempts", 0,
+                ),
+            )
+            hypothesis.current_state = None
+            hypothesis.refined_streak = 0
+            hypothesis.ocrs_outcome = label
+            self.state_machine.ocrs_label = label
+            if self.state_machine.current_hypothesis_id == hypothesis.id:
+                self.state_machine.current_hypothesis_id = None
+            if self.debug:
+                print(
+                    f"🧪 OCRS closed H{hypothesis.id} as {forced_status} "
+                    f"(label={label}, trigger={trigger})"
+                )
+            return True
+
+        # no_force_exit branch: honor the LLM's natural status; only close the
+        # hypothesis if the LLM itself chose CONFIRMED/REFUTED.
+        label = "supported" if forced_status == "CONFIRMED" else label_hint
+        hypothesis.ocrs_outcome = label
+        self.state_machine.ocrs_label = label
+        if forced_status in ("CONFIRMED", "REFUTED"):
+            self.state_machine.update_hypothesis(hypothesis.id, forced_status)
+            self._record_action(
+                "hypothesis_status_update",
+                state="OCRS",
+                hypothesis_id=hypothesis.id,
+                status=forced_status,
+                refined=False,
+                trigger=trigger,
+                force_exit=False,
+                hypothesis_test_count=len(hypothesis.test_history),
+                global_test_count=len(self.state_machine.test_history),
+                steering_calls_used=getattr(
+                    self.state_machine, "steering_calls_used", 0,
+                ),
+                dynamic_steer_attempts=getattr(
+                    self.state_machine, "dynamic_steer_attempts", 0,
+                ),
+            )
+            hypothesis.current_state = None
+            hypothesis.refined_streak = 0
+            if self.state_machine.current_hypothesis_id == hypothesis.id:
+                self.state_machine.current_hypothesis_id = None
+        else:
+            # LLM kept the hypothesis in the loop (REFINED/UNCHANGED). Reset
+            # refined_streak so trigger #1 doesn't immediately re-fire next round;
+            # the ocrs_outcome guard at the top will block re-injection anyway.
+            hypothesis.refined_streak = 0
+            if forced_status in ("REFINED", "UNCHANGED"):
+                self.state_machine.update_hypothesis(hypothesis.id, forced_status)
+                self._record_action(
+                    "hypothesis_status_update",
+                    state="OCRS",
+                    hypothesis_id=hypothesis.id,
+                    status=forced_status,
+                    refined=False,
+                    trigger=trigger,
+                    force_exit=False,
+                    hypothesis_test_count=len(hypothesis.test_history),
+                    global_test_count=len(self.state_machine.test_history),
+                    steering_calls_used=getattr(
+                        self.state_machine, "steering_calls_used", 0,
+                    ),
+                    dynamic_steer_attempts=getattr(
+                        self.state_machine, "dynamic_steer_attempts", 0,
+                    ),
+                )
+            hypothesis.current_state = SAGEState.DESIGN_TEST
+        if self.debug:
+            print(
+                f"🧪 OCRS injected H{hypothesis.id} (no_force_exit; "
+                f"llm_status={forced_status}, label={label}, trigger={trigger})"
+            )
+        return True
+
+    def _sage_causal_check_triggers(self, hypothesis: Hypothesis) -> Optional[str]:
+        """Return a non-empty trigger reason if any of the 6 OCRS conditions fire."""
+        # 1. Same hypothesis refined/unchanged ≥2 in a row.
+        if hypothesis.refined_streak >= 2:
+            return "refined_streak_>=2"
+        # 2. Hypothesis has ≥3 tests but still active (not CONFIRMED/REFUTED).
+        if len(hypothesis.test_history) >= 3 and hypothesis.current_state is not None:
+            return "tests_>=3_unresolved"
+        # 3. Latest test was negative AND a prior negative-control was also inconclusive.
+        if len(hypothesis.test_history) >= 2:
+            last = hypothesis.test_history[-1]
+            prev = hypothesis.test_history[-2]
+            if last.result in ("REFUTED", "INCONCLUSIVE") and prev.result == "INCONCLUSIVE":
+                return "positive_failed_and_control_unclear"
+        # 4. Low input/output agreement (computed at triage time).
+        agreement = (self.state_machine.triage_signals or {}).get("agreement", 1.0)
+        if agreement is not None and agreement < 0.15:
+            return f"low_io_agreement({agreement:.3f})"
+        # 5. Round budget mostly consumed without any terminal hypothesis.
+        confirmed_or_refuted = [
+            h for h in self.state_machine.hypotheses if h.status in ("CONFIRMED", "REFUTED")
+        ]
+        if self.state_machine.round >= 8 and not confirmed_or_refuted:
+            return f"round_{self.state_machine.round}_no_terminal"
+        # 6. Multiple hypotheses with partial evidence — suspected polysemantic.
+        partial = [
+            h for h in self.state_machine.hypotheses
+            if h.status in ("REFINED", "UNCHANGED", "PENDING") and len(h.test_history) >= 1
+        ]
+        if len(partial) >= 2:
+            return f"polysemantic_suspect({len(partial)}_partial)"
+        return None
+
+    def _shes_snapshot(self) -> List[Dict[str, Any]]:
+        """Compact current SHES scores for prompt injection and trace audit."""
+        rows = []
+        for h in self.state_machine.hypotheses:
+            history = getattr(h, "evidence_score_history", [])
+            rows.append({
+                "hypothesis_id": h.id,
+                "status": h.status,
+                "tests": len(history),
+                "score": float(getattr(h, "evidence_score", 0.0)),
+                "recent_scores": [
+                    float(item.get("score", 0.0))
+                    for item in history[-int(getattr(self.state_machine, "shes_window", 2)):]
+                ],
+            })
+        return rows
+
+    def _shes_active_checkpoint_rows(self) -> List[Dict[str, Any]]:
+        """Compact active-hypothesis rows at a SHES decision checkpoint."""
+        rows = []
+        for h in self.state_machine.get_active_hypotheses():
+            if getattr(h, "ocrs_outcome", None) is not None:
+                continue
+            history = getattr(h, "evidence_score_history", [])
+            rows.append({
+                "hypothesis_id": h.id,
+                "status": h.status,
+                "tests": len(history),
+                "score": float(getattr(h, "evidence_score", 0.0)),
+            })
+        return rows
+
+    def _recent_test_results_for_dynamic_steer(
+        self, hypothesis: Hypothesis, limit: int = 4
+    ) -> List[Dict[str, Any]]:
+        """Compact recent input-side test results for dynamic steer design."""
+        rows = []
+        for test in (hypothesis.test_history or [])[-limit:]:
+            rows.append({
+                "id": test.id,
+                "prompt": test.prompt,
+                "expected": test.expected,
+                "activation": test.actual_activation,
+                "normalized_activation": test.normalized_activation,
+                "result": test.result,
+            })
+        return rows
+
+    def _call_dynamic_steer_llm(self, prompt: str) -> str:
+        """Run a single isolated LLM call for dynamic steering JSON design."""
+        history = [
+            {
+                "role": "system",
+                "content": (
+                    "You design Neuronpedia steering prompts. Return only valid "
+                    "JSON matching the user's schema."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        model = getattr(self.variant_config, "dynamic_steer_llm", None) or self.llm_client
+        max_tokens = int(
+            getattr(self.variant_config, "dynamic_steer_max_completion_tokens", 768)
+            or 768
+        )
+        self._record_action(
+            "sage_causal_dynamic_steer_llm_call",
+            model=model,
+            max_completion_tokens=max_tokens,
+            prompt_length=len(prompt),
+        )
+        return ask_agent(model, history, max_completion_tokens=max_tokens)
+
+    def _sage_causal_fetch_ocrs_evidence(
+        self, hypothesis: Hypothesis, trigger: str
+    ) -> Optional[Dict[str, Any]]:
+        """Run one steering call and return an OCRS evidence dict.
+
+        When the variant disables method-time steering, fall back to the cached
+        logit-lens projection as causal evidence — no API call, no budget use.
+        Dynamic steering variants ask the LLM for a hypothesis-conditioned prompt
+        first, then fall back to the static exemplar-derived prompt on any design
+        failure.
+        """
+        if not self.variant_config.enable_method_time_steering:
+            return self._build_lens_only_ocrs_evidence(hypothesis, trigger)
+
+        model = self.feature_spec.get("neuronpedia_model_id")
+        source = self.feature_spec.get("source")
+        feature_index = self.feature_spec.get("feature_index", self.feature_id)
+        if not model or not source:
+            return None
+
+        exemplar_dicts = [
+            {
+                "tokens": (getattr(ex, "tokens", []) or [])[:40],
+                "per_token_activations": (
+                    getattr(ex, "per_token_activations", []) or []
+                )[:40],
+                "max_activation": getattr(ex, "activation", 0.0),
+                "text": (getattr(ex, "text", "") or "")[:500],
+            }
+            for ex in (self.state_machine.exemplars or [])
+        ]
+        steering_prompt_source = "static"
+        dynamic_spec = None
+        dynamic_error = None
+        if getattr(self.variant_config, "enable_dynamic_steer", False):
+            self.state_machine.dynamic_steer_attempts = (
+                getattr(self.state_machine, "dynamic_steer_attempts", 0) + 1
+            )
+            try:
+                dynamic_spec = _sc_design_steer_prompt(
+                    hypothesis_text=hypothesis.text,
+                    top_exemplars=exemplar_dicts[
+                        : int(getattr(self.variant_config, "dynamic_steer_top_exemplars", 3))
+                    ],
+                    recent_test_results=self._recent_test_results_for_dynamic_steer(
+                        hypothesis,
+                        limit=int(
+                            getattr(self.variant_config, "dynamic_steer_recent_tests", 2)
+                        ),
+                    ),
+                    llm_caller=self._call_dynamic_steer_llm,
+                )
+                prompt = dynamic_spec.prompt
+                steering_prompt_source = "dynamic"
+                self._record_action(
+                    "sage_causal_dynamic_steer_prompt",
+                    hypothesis_id=hypothesis.id,
+                    trigger=trigger,
+                    prompt=prompt,
+                    expected_boost_tokens=dynamic_spec.expected_boost_tokens,
+                    expected_suppress_tokens=dynamic_spec.expected_suppress_tokens,
+                )
+            except Exception as exc:
+                dynamic_error = str(exc)
+                self.state_machine.dynamic_steer_fallbacks = (
+                    getattr(self.state_machine, "dynamic_steer_fallbacks", 0) + 1
+                )
+                steering_prompt_source = "static"
+                self._record_action(
+                    "sage_causal_dynamic_steer_fallback",
+                    hypothesis_id=hypothesis.id,
+                    trigger=trigger,
+                    error=dynamic_error,
+                )
+                prompt = _sc_select_prompt(exemplar_dicts) or "The"
+        else:
+            prompt = _sc_select_prompt(exemplar_dicts) or "The"
+
+        try:
+            result = _sc_steer_feature(
+                model, source, int(feature_index),
+                prompt=prompt, strength=8.0, n_tokens=8,
+            )
+        except Exception as exc:
+            self._record_action(
+                "sage_causal_ocrs_steer_failed",
+                hypothesis_id=hypothesis.id,
+                error=str(exc),
+            )
+            return None
+
+        self.state_machine.steering_calls_used += 1
+
+        label_hint, agreement_audit = self._sage_causal_steering_agreement_label(
+            result,
+            dynamic_spec,
+        )
+
+        call_log = {
+            "source": "steering",
+            "steering_prompt_source": steering_prompt_source,
+            "hypothesis_id": hypothesis.id,
+            "trigger": trigger,
+            "prompt": prompt,
+            "strength": result.strength,
+            "feature_index": int(feature_index),
+            "boosted_any_position": result.boosted_tokens_any_position,
+            "suppressed_any_position": result.suppressed_tokens_any_position,
+            "ocrs_label_hint": label_hint,
+            "agreement_audit": agreement_audit,
+        }
+        if dynamic_spec is not None:
+            call_log["steer_prompt_spec"] = dynamic_spec.to_dict()
+        if dynamic_error is not None:
+            call_log["dynamic_error"] = dynamic_error
+        self.state_machine.steering_calls_log.append(call_log)
+
+        return {
+            "source": "steering",
+            "steering_prompt_source": steering_prompt_source,
+            "prompt": prompt,
+            "strength": result.strength,
+            "default_text": result.default_text,
+            "steered_text": result.steered_text,
+            "boosted_any_position": result.boosted_tokens_any_position,
+            "suppressed_any_position": result.suppressed_tokens_any_position,
+            "trigger": trigger,
+            "ocrs_label_hint": label_hint,
+            "agreement_audit": agreement_audit,
+            "shes_snapshot": self._shes_snapshot(),
+            "steer_prompt_spec": (
+                dynamic_spec.to_dict() if dynamic_spec is not None else None
+            ),
+            "dynamic_error": dynamic_error,
+        }
+
+    def _sage_causal_steering_agreement_label(
+        self, result: Any, dynamic_spec: Optional[Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Infer OCRS label hint from steering output and record agreement details."""
+        boosted = result.boosted_tokens_any_position or []
+        suppressed = result.suppressed_tokens_any_position or []
+        if not boosted and not suppressed:
+            return "incoherent", {
+                "mode": "empty_steering_output",
+                "support_score": 0.0,
+                "contradiction_score": 0.0,
+            }
+
+        if dynamic_spec is not None:
+            expected_boost = dynamic_spec.expected_boost_tokens
+            expected_suppress = dynamic_spec.expected_suppress_tokens
+            boost_match = _sc_compute_agreement(expected_boost, boosted, suppressed)
+            suppress_match = _sc_compute_agreement(expected_suppress, suppressed, boosted)
+            support_score = max(boost_match.pos_score, suppress_match.pos_score)
+            contradiction_score = max(boost_match.neg_score, suppress_match.neg_score)
+            audit = {
+                "mode": "dynamic_expected_token_agreement",
+                "support_score": support_score,
+                "contradiction_score": contradiction_score,
+                "boost_components": boost_match.components,
+                "suppress_components": suppress_match.components,
+            }
+            if support_score < 0.15 and contradiction_score < 0.15:
+                return "incoherent", audit
+            if support_score >= contradiction_score:
+                return "supported", audit
+            return "divergent", audit
+
+        t_in = self._sage_causal_top_exemplar_tokens(20)
+        agreement = _sc_compute_agreement(t_in, boosted, suppressed)
+        audit = {
+            "mode": "static_exemplar_token_agreement",
+            "agreement": agreement.agreement,
+            "direction": agreement.direction,
+            "pos_score": agreement.pos_score,
+            "neg_score": agreement.neg_score,
+            "components": agreement.components,
+        }
+        if agreement.agreement < 0.15:
+            return "incoherent", audit
+        if agreement.direction == "pos":
+            return "supported", audit
+        return "divergent", audit
+
+    def _build_lens_only_ocrs_evidence(
+        self, hypothesis: Hypothesis, trigger: str
+    ) -> Optional[Dict[str, Any]]:
+        """OCRS evidence from cached logit-lens (no API call, no budget consumed)."""
+        lens = getattr(self.state_machine, "logit_lens_data", None) or {}
+        lens_pos = lens.get("pos_tokens") or []
+        lens_neg = lens.get("neg_tokens") or []
+        if not lens_pos and not lens_neg:
+            self._record_action(
+                "sage_causal_ocrs_lens_skip",
+                hypothesis_id=hypothesis.id,
+                reason="no_cached_logit_lens",
+            )
+            return None
+
+        if not lens_pos:
+            label_hint = "incoherent"
+        else:
+            t_in_norm = {self._sc_normalize(t) for t in self._sage_causal_top_exemplar_tokens(20)}
+            pos_norm = {self._sc_normalize(t) for t in lens_pos}
+            label_hint = "supported" if (t_in_norm & pos_norm) else "divergent"
+
+        return {
+            "source": "logit_lens",
+            "prompt": None,
+            "strength": "logit-lens projection (W_U @ f)",
+            "default_text": "",
+            "steered_text": "",
+            "boosted_any_position": lens_pos,
+            "suppressed_any_position": lens_neg,
+            "trigger": trigger,
+            "ocrs_label_hint": label_hint,
+            "shes_snapshot": self._shes_snapshot(),
+        }
+
+    @staticmethod
+    def _sc_normalize(token: str) -> str:
+        return token.lstrip("▁").strip().strip("'\".,;:()[]{}").lower()
+
+    def _capture_output_aware_note(self):
+        """Record output-aware audit availability for the current run."""
+        if self.output_audit.get("status") == "completed":
+            return
+        system = getattr(self.tools, "system", None)
+        if getattr(system, "use_api_for_activations", False):
+            self.output_audit["status"] = "unavailable_api_mode"
+            self.output_audit["notes"].append(
+                "Output/logit/steering evidence requires a local model; Neuronpedia API mode only supports activation traces."
+            )
+        elif not getattr(system, "model", None) or not getattr(system, "tokenizer", None):
+            self.output_audit["status"] = "unavailable_no_local_model"
+            self.output_audit["notes"].append(
+                "Local model or tokenizer was not loaded, so output-aware validation could not be computed."
+            )
+        else:
+            self.output_audit["status"] = "available_not_implemented"
+            self.output_audit["notes"].append(
+                "Local model is available; implement logit-lens/steering probes here for the next Agent4Interp iteration."
+            )
+
+    def _infer_failure_mode(self) -> str:
+        if self.error_reason:
+            return self.error_reason
+        skip_reason = getattr(self.state_machine, "skip_reason", None)
+        if skip_reason:
+            return f"skipped_{skip_reason}"
+        if self.state_machine.exemplars and all(getattr(ex, "activation", 0.0) <= 0 for ex in self.state_machine.exemplars):
+            return "dead_or_suppression_feature"
+        if not self.state_machine.hypotheses:
+            return "no_hypotheses_generated"
+        if self.variant_config.active_testing and not self.state_machine.test_history:
+            return "no_tests_executed"
+        if not any("[DESCRIPTION]:" in item for item in self.state_machine.analysis_history):
+            return "no_valid_conclusion"
+        confirmed = [h for h in self.state_machine.hypotheses if h.status == "CONFIRMED"]
+        if self.variant_config.active_testing and not confirmed:
+            return "no_confirmed_hypothesis"
+        return "none"
+
+    def _build_experiment_trace(self) -> Dict[str, Any]:
+        exemplars = []
+        for i, ex in enumerate(self.state_machine.exemplars or [], 1):
+            exemplars.append({
+                "rank": i,
+                "text": getattr(ex, "text", ""),
+                "activation": getattr(ex, "activation", 0.0),
+                "tokens": getattr(ex, "tokens", []),
+                "per_token_activations": getattr(ex, "per_token_activations", []),
+            })
+
+        hypotheses = []
+        for h in self.state_machine.hypotheses:
+            hypotheses.append({
+                "id": h.id,
+                "initial_text": h.initial_text,
+                "current_text": h.text,
+                "status": h.status,
+                "evidence_score": getattr(h, "evidence_score", 0.0),
+                "evidence_score_history": getattr(h, "evidence_score_history", []),
+                "tests": [
+                    {
+                        "id": t.id,
+                        "prompt": t.prompt,
+                        "expected": t.expected,
+                        "activation": t.actual_activation,
+                        "result": t.result,
+                    }
+                    for t in h.test_history
+                ],
+                "refinement_decisions": [
+                    item for item in h.analysis_history
+                    if "HYPOTHESIS UPDATES:" in item or "UPDATED HYPOTHESIS STATUS:" in item
+                ],
+            })
+
+        final_explanation = ""
+        for item in reversed(self.state_machine.analysis_history):
+            if "[DESCRIPTION]:" in item:
+                final_explanation = item
+                break
+
+        return {
+            "feature_spec": self.feature_spec,
+            "variant": self.experiment_variant,
+            "variant_config": self.variant_config.to_dict(),
+            "exemplar_observation": exemplars,
+            "hypotheses": hypotheses,
+            "designed_tests": [
+                {"id": t.id, "hypothesis_id": t.hypothesis_id, "prompt": t.prompt, "expected": t.expected}
+                for t in self.state_machine.test_history
+            ],
+            "activation_results": [
+                {"id": t.id, "hypothesis_id": t.hypothesis_id, "activation": t.actual_activation, "result": t.result}
+                for t in self.state_machine.test_history
+            ],
+            "agent_actions": self.agent_actions,
+            "output_audit": self.output_audit,
+            "shes": {
+                "enabled": getattr(self.state_machine, "shes_enabled", False),
+                "threshold": getattr(self.state_machine, "shes_threshold", None),
+                "threshold_factor": getattr(
+                    self.state_machine, "shes_threshold_factor", None,
+                ),
+                "window": getattr(self.state_machine, "shes_window", None),
+                "epsilon": getattr(self.state_machine, "shes_epsilon", None),
+                "min_tests": getattr(self.state_machine, "shes_min_tests", None),
+                "triggered": getattr(self.state_machine, "shes_triggered", False),
+                "trigger_reason": getattr(self.state_machine, "shes_trigger_reason", None),
+                "events": getattr(self.state_machine, "shes_events", []),
+            },
+            "steering_calls_log": getattr(self.state_machine, "steering_calls_log", []),
+            "dynamic_steer_attempts": getattr(
+                self.state_machine, "dynamic_steer_attempts", 0,
+            ),
+            "dynamic_steer_fallbacks": getattr(
+                self.state_machine, "dynamic_steer_fallbacks", 0,
+            ),
+            "failure_mode": self._infer_failure_mode(),
+            "final_explanation": final_explanation,
+        }
 
     def _execute_supplemental_tests(self):
         """执行REVIEW建议的补充测试"""
@@ -1677,7 +3322,7 @@ This feature requires further investigation due to insufficient data.
                 if status in valid_statuses:
                     # 默认更新第一个假设
                     updates.append({
-                        "hypothesis_id": 1,
+                        "hypothesis_id": self.state_machine.current_hypothesis_id or 1,
                         "status": status,
                         "refined_text": None
                     })

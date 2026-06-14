@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import math
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -121,7 +122,7 @@ class System:
         Returns the feature activation for each text in the input list.
     """
 
-    def __init__(self, llm_name: str, sae_path: str, sae_layer: int, feature_index: int, device: str = "cpu", thresholds: Optional[Dict] = None, debug: bool = False, use_api_for_activations: bool = False, neuronpedia_model_id: Optional[str] = None, neuronpedia_source: Optional[str] = None):
+    def __init__(self, llm_name: str, sae_path: str, sae_layer: int, feature_index: int, device: str = "cpu", thresholds: Optional[Dict] = None, debug: bool = False, use_api_for_activations: bool = False, neuronpedia_model_id: Optional[str] = None, neuronpedia_source: Optional[str] = None, api_debug: bool = False):
         """
         Initializes a SAE feature object by specifying its index and layer location
         and the language model that the feature belongs to.
@@ -155,6 +156,7 @@ class System:
         self.use_api_for_activations = use_api_for_activations
         self.neuronpedia_model_id = neuronpedia_model_id
         self.neuronpedia_source = neuronpedia_source
+        self.api_debug = api_debug
         # Robust device parsing: "cpu" forces CPU; numeric or "cuda" selects GPU if available
         if TORCH_AVAILABLE:
             parsed_device: Union[str, torch.device]
@@ -542,10 +544,16 @@ class System:
         }
         
         try:
+            if self.api_debug:
+                self._print_api_debug("request", url, payload)
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
             
             result = response.json()
+            if self.api_debug:
+                self._print_api_debug(
+                    "response", url, result, status_code=response.status_code
+                )
             
             # Check if response contains error field
             if 'error' in result and result['error']:
@@ -609,6 +617,24 @@ class System:
             raise ValueError(
                 f"Invalid response from Neuronpedia API for text '{text[:50]}...': {e}"
             ) from e
+
+    def _print_api_debug(
+        self,
+        phase: str,
+        url: str,
+        payload: Any,
+        status_code: Optional[int] = None,
+        limit: int = 2000,
+    ) -> None:
+        """Print compact Neuronpedia API debug info to the process log."""
+        try:
+            body = json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception:
+            body = str(payload)
+        if len(body) > limit:
+            body = body[:limit] + "...<truncated>"
+        status = f" status={status_code}" if status_code is not None else ""
+        print(f"[API DEBUG] {phase.upper()} {url}{status}: {body}")
 
     def get_activation_trace(self, text: str) -> Dict[str, Any]:
         """Return a detailed activation trace for a single text input.
@@ -793,5 +819,3 @@ class System:
 
 
 __all__ = ["SAEConfig", "System"]
-
-

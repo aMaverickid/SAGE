@@ -1,0 +1,65 @@
+{
+  "protocol": {
+    "seed": 0,
+    "split": "pilot",
+    "models": [
+      "gemma-2-2b"
+    ],
+    "layers": [
+      3
+    ],
+    "features_per_layer": 5,
+    "feature_range": [
+      0,
+      15999
+    ],
+    "selection_method": "uniform_without_replacement_per_model_layer"
+  },
+  "features": [
+    {
+      "model_name": "google/gemma-2-2b",
+      "neuronpedia_model_id": "gemma-2-2b",
+      "layer": "layer3",
+      "layer_index": 3,
+      "source": "3-gemmascope-mlp-16k",
+      "feature_index": 13835,
+      "split": "pilot"
+    },
+    {
+      "model_name": "google/gemma-2-2b",
+      "neuronpedia_model_id": "gemma-2-2b",
+      "layer": "layer3",
+      "layer_index": 3,
+      "source": "3-gemmascope-mlp-16k",
+      "feature_index": 6311,
+      "split": "pilot"
+    },
+    {
+      "model_name": "google/gemma-2-2b",
+      "neuronpedia_model_id": "gemma-2-2b",
+      "layer": "layer3",
+      "layer_index": 3,
+      "source": "3-gemmascope-mlp-16k",
+      "feature_index": 12418,
+      "split": "pilot"
+    },
+    {
+      "model_name": "google/gemma-2-2b",
+      "neuronpedia_model_id": "gemma-2-2b",
+      "layer": "layer3",
+      "layer_index": 3,
+      "source": "3-gemmascope-mlp-16k",
+      "feature_index": 14585,
+      "split": "pilot"
+    },
+    {
+      "model_name": "google/gemma-2-2b",
+      "neuronpedia_model_id": "gemma-2-2b",
+      "layer": "layer3",
+      "layer_index": 3,
+      "source": "3-gemmascope-mlp-16k",
+      "feature_index": 6890,
+      "split": "pilot"
+    }
+  ]
+}

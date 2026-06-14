@@ -1,0 +1,21 @@
+
+python-dotenv
+requests
+openai
+anthropic
+google-generativeai
+
+
+numpy
+scipy
+
+
+torch
+transformers
+transformer-lens
+sae-lens
+sentencepiece
+
+# Dataset / text handling
+datasets
+ftfy

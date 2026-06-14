@@ -42,6 +42,13 @@ class Hypothesis:
     analysis_history: List[str] = field(default_factory=list)  # Analysis history for this hypothesis
     initial_text: str = ""  # Initial hypothesis text
     latest_test_execution_output: str = ""  # Complete execution output of last test (for ANALYZE_RESULT)
+    # SAGE-Causal: consecutive REFINED/UNCHANGED updates since last terminal decision.
+    # Reset on CONFIRMED/REFUTED. Used by OCRS trigger #1 (≥2 = spin).
+    refined_streak: int = 0
+    ocrs_outcome: Optional[str] = None  # "supported" | "divergent" | "incoherent" if OCRS closed this hyp
+    # SHES: low-cost evidence score accumulated from activation-test margins.
+    evidence_score: float = 0.0
+    evidence_score_history: List[Dict[str, Any]] = field(default_factory=list)
     
     def __post_init__(self):
         """Initialize list fields."""
@@ -88,18 +95,55 @@ class SAGEStateMachine:
         self.test_history: List[TestResult] = []  # Global test history (for compatibility)
         self.exemplars: Optional[List[Exemplar]] = None
         self.analysis_history: List[str] = []  # Global analysis history (for compatibility)
+        self.skip_reason: Optional[str] = None
+        self.skip_detail: Optional[str] = None
         
         # Parallel hypothesis processing related
         self.current_hypothesis_id: Optional[int] = None  # Currently processing hypothesis ID
         self.hypothesis_review_result: Optional[str] = None  # Result of REVIEW_ALL_HYPOTHESES
+
+        # SAGE-Causal state (populated when enable_logit_lens / enable_triage / enable_ocrs)
+        self.triage_path: Optional[str] = None  # "FAST" | "STANDARD" | "DEEP"
+        self.triage_signals: Dict[str, Any] = {}  # agreement, entropy, components — for audit
+        self.logit_lens_data: Optional[Dict[str, Any]] = None  # pos/neg tokens + values
+        self.steering_prior_data: Optional[Dict[str, Any]] = None  # ablation 5: one-shot steering for ANALYZE_EXEMPLARS
+        self.ocrs_triggered: bool = False
+        self.ocrs_label: Optional[str] = None  # "supported" | "divergent" | "incoherent"
+        self.ocrs_evidence: Optional[Dict[str, Any]] = None  # latest steering result for prompt injection
+        self.ocrs_trigger_reason: Optional[str] = None  # which of the 6 triggers fired
+        self.steering_calls_log: List[Dict[str, Any]] = []
+        self.dynamic_steer_attempts: int = 0
+        self.dynamic_steer_fallbacks: int = 0
+        self.steering_calls_used: int = 0
+        self.steering_calls_budget: int = 3  # hard upper bound per feature
+        self.shes_enabled: bool = False
+        self.shes_threshold: Optional[float] = None
+        self.shes_threshold_factor: float = 0.5
+        self.shes_window: int = 2
+        self.shes_epsilon: float = 0.08
+        self.shes_min_tests: int = 2
+        self.shes_triggered: bool = False
+        self.shes_trigger_reason: Optional[str] = None
+        self.shes_events: List[Dict[str, Any]] = []
+        self.global_steering_triggered: bool = False
+        self.global_steering_reason: Optional[str] = None
+        self.global_steering_evidence: List[Dict[str, Any]] = []
+        self.global_steering_prompts: List[str] = []
         
         # State transition rules
         self.valid_transitions = {
             SAGEState.INIT: [SAGEState.GET_EXEMPLARS],
-            SAGEState.GET_EXEMPLARS: [SAGEState.ANALYZE_EXEMPLARS],
-            SAGEState.ANALYZE_EXEMPLARS: [SAGEState.PARALLEL_HYPOTHESIS_TESTING],  # Changed to parallel testing
+            SAGEState.GET_EXEMPLARS: [
+                SAGEState.ANALYZE_EXEMPLARS,
+                SAGEState.FINAL_CONCLUSION,
+            ],
+            SAGEState.ANALYZE_EXEMPLARS: [SAGEState.PARALLEL_HYPOTHESIS_TESTING, SAGEState.FINAL_CONCLUSION],  # Some ablations skip active testing
             SAGEState.FORM_HYPOTHESIS: [SAGEState.PARALLEL_HYPOTHESIS_TESTING],  # Keep for backward compatibility
-            SAGEState.PARALLEL_HYPOTHESIS_TESTING: [SAGEState.DESIGN_TEST, SAGEState.REVIEW_ALL_HYPOTHESES],
+            SAGEState.PARALLEL_HYPOTHESIS_TESTING: [
+                SAGEState.DESIGN_TEST,
+                SAGEState.REVIEW_ALL_HYPOTHESES,
+                SAGEState.FINAL_CONCLUSION,
+            ],
             SAGEState.DESIGN_TEST: [SAGEState.RUN_TEST, SAGEState.ANALYZE_RESULT],
             SAGEState.RUN_TEST: [SAGEState.ANALYZE_RESULT],
             SAGEState.ANALYZE_RESULT: [SAGEState.UPDATE_HYPOTHESIS],
@@ -284,6 +328,12 @@ class SAGEStateMachine:
         """Force conclude."""
         self.state = SAGEState.FINAL_CONCLUSION
         self.round = self.max_rounds
+
+    def skip(self, reason: str, detail: str = ""):
+        """Mark this feature as intentionally skipped."""
+        self.skip_reason = reason
+        self.skip_detail = detail
+        self.state = SAGEState.DONE
     
     def is_final_state(self) -> bool:
         """Check if in final state."""
