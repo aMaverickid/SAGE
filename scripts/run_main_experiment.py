@@ -117,6 +117,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--retry_failed", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--retry_skipped",
+        action="store_true",
+        help="Generation stage: rerun tasks with skipped_log.json while still "
+             "skipping completed description.txt results.",
+    )
     parser.add_argument("--force_generate", action="store_true")
     parser.add_argument("--skip_output", action="store_true")
     parser.add_argument("--skip_input", action="store_true")
@@ -352,6 +358,8 @@ def _add_resume_flags(cmd: List[str], args: argparse.Namespace) -> None:
         cmd.append("--resume")
     if args.retry_failed:
         cmd.append("--retry_failed")
+    if args.retry_skipped:
+        cmd.append("--retry_skipped")
 
 
 def _add_eval_reuse_flags(cmd: List[str], args: argparse.Namespace) -> None:

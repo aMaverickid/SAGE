@@ -38,6 +38,9 @@ SUPPORTED_VARIANTS = {
     "shes_commit_dynamic_evidence_eps050",
     "shes_commit_dynamic_evidence_eps075",
     "shes_commit_static_evidence",
+    "shes_commit_static_evidence_eps050",
+    "shes_commit_static_evidence_eps075",
+    "shes_commit_no_evidence_eps050",
     "shes_commit_only",
     "one_shot_maxact",
     "one_shot_maxact_lens",
@@ -70,7 +73,7 @@ class VariantConfig:
     shes_min_tests: int = 2
     shes_threshold_factor: float = 0.5
     one_shot_description: bool = False
-    dynamic_steer_llm: str = "gpt-5-mini"
+    dynamic_steer_llm: str = "gpt-5.4-mini"
     dynamic_steer_max_completion_tokens: int = 768
     dynamic_steer_top_exemplars: int = 3
     dynamic_steer_recent_tests: int = 2
@@ -440,6 +443,61 @@ def get_variant_config(name: str) -> VariantConfig:
                 "Paper alias for sage_causal_ocrs_only: SHES-independent static "
                 "OCRS evidence baseline using the existing exemplar-derived "
                 "steering prompt and forced commitment."
+            ),
+        ),
+        
+        "shes_commit_static_evidence_eps050": VariantConfig(
+            name="shes_commit_static_evidence_eps050",
+            enable_ocrs=True,
+            enable_method_time_steering=True,
+            enable_force_exit=True,
+            enable_ocrs_evidence=True,
+            enable_dynamic_steer=False,
+            enable_shes=True,
+            shes_epsilon=0.50,
+            description=(
+                "Static-evidence SHES-OCRS matched control for "
+                "shes_commit_dynamic_evidence_eps050: uses the same SHES "
+                "stagnation trigger, epsilon=0.50, steering call, and forced "
+                "commitment, but keeps the static exemplar-derived steering "
+                "prompt instead of designing a hypothesis-conditioned dynamic "
+                "steering prompt."
+            ),
+        ),
+        
+        "shes_commit_static_evidence_eps075": VariantConfig(
+            name="shes_commit_static_evidence_eps075",
+            enable_ocrs=True,
+            enable_method_time_steering=True,
+            enable_force_exit=True,
+            enable_ocrs_evidence=True,
+            enable_dynamic_steer=False,
+            enable_shes=True,
+            shes_epsilon=0.75,
+            description=(
+                "Static-evidence SHES-OCRS matched control for "
+                "shes_commit_dynamic_evidence_eps075: uses the same SHES "
+                "stagnation trigger, epsilon=0.75, steering call, and forced "
+                "commitment, but keeps the static exemplar-derived steering "
+                "prompt instead of designing a hypothesis-conditioned dynamic "
+                "steering prompt."
+            ),
+        ),
+        
+        "shes_commit_no_evidence_eps050": VariantConfig(
+            name="shes_commit_no_evidence_eps050",
+            enable_ocrs=True,
+            enable_ocrs_evidence=False,
+            enable_force_exit=True,
+            enable_shes=True,
+            shes_epsilon=0.50,
+            description=(
+                "No-evidence SHES-OCRS matched control for "
+                "shes_commit_dynamic_evidence_eps050: uses the same SHES "
+                "stagnation trigger, epsilon=0.50, and forced commitment, but "
+                "does not show any output-side steering evidence before the "
+                "terminal CONFIRMED/REFUTED decision. Isolates the contribution "
+                "of causal evidence content from SHES-triggered commitment."
             ),
         ),
         "shes_commit_only": VariantConfig(

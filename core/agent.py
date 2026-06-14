@@ -220,7 +220,7 @@ def ask_agent(
                 return response.content[0].text
 
             # Handle OpenAI models
-            elif model in ['gpt-5.2', 'gpt-5.5', 'gpt-5-nano', 'gpt-5-mini', 'gpt-5', 'gpt-4o-new', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4'] and OPENAI_AVAILABLE:
+            elif model in ['gpt-5.4-mini', 'gpt-5.4', 'gpt-5.2', 'gpt-5.5', 'gpt-5-nano', 'gpt-5-mini', 'gpt-5', 'gpt-4o-new', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4'] and OPENAI_AVAILABLE:
                 if model == 'gpt-4o-new':
                     model = 'gpt-4o-2024-11-20'
 
@@ -350,7 +350,7 @@ def ask_agent(
 
             else:
                 print(f"❌ ERROR: Unrecognized model name: {model}")
-                available_models = ['gpt-5-nano', 'gpt-5-mini', 'gpt-5', 'gpt-4o-new', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4']
+                available_models = ['gpt-5.4', 'gpt-5.2', 'gpt-5.5', 'gpt-5-nano', 'gpt-5-mini', 'gpt-5', 'gpt-4o-new', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4']
                 print(f"❌ Available models: {available_models}")
                 print(f"❌ OPENAI_AVAILABLE: {OPENAI_AVAILABLE}")
                 raise ValueError(f"Unrecognized model name: {model}. Available models: {available_models}")

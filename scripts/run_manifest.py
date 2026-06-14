@@ -88,6 +88,11 @@ def parse_args() -> tuple[argparse.Namespace, List[str]]:
              "description.txt. Completed descriptions are still skipped.",
     )
     parser.add_argument(
+        "--retry_skipped", action="store_true",
+        help="Parallel mode: rerun tasks with skipped_log.json. Completed "
+             "descriptions are still skipped.",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Parallel mode: run even if description.txt already exists.",
     )
@@ -350,12 +355,19 @@ def _filter_tasks(args: argparse.Namespace, tasks: List[Task]) -> List[Task]:
     skipped_done = 0
     skipped_failed = 0
     skipped_marked = 0
+    retrying_marked = 0
     for task in tasks:
         done = (task.result_dir / "description.txt").exists()
         skipped = (task.result_dir / "skipped_log.json").exists()
         failed = (task.result_dir / "error_log.json").exists()
-        if done and (args.resume or args.retry_failed):
+        if done and (args.resume or args.retry_failed or args.retry_skipped):
             skipped_done += 1
+            continue
+        if skipped and args.retry_skipped:
+            retrying_marked += 1
+            if "--force" not in task.command:
+                task.command.append("--force")
+            pending.append(task)
             continue
         if skipped and (args.resume or args.retry_failed):
             skipped_marked += 1
@@ -364,10 +376,11 @@ def _filter_tasks(args: argparse.Namespace, tasks: List[Task]) -> List[Task]:
             skipped_failed += 1
             continue
         pending.append(task)
-    if skipped_done or skipped_failed or skipped_marked:
+    if skipped_done or skipped_failed or skipped_marked or retrying_marked:
         print(
             f"Skipped completed: {skipped_done}; "
-            f"skipped marked: {skipped_marked}; skipped failed: {skipped_failed}"
+            f"skipped marked: {skipped_marked}; skipped failed: {skipped_failed}; "
+            f"retrying marked: {retrying_marked}"
         )
     return pending
 
