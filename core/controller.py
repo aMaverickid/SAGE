@@ -102,10 +102,15 @@ class SAGEController:
             while not self.state_machine.is_final_state():
                 self._execute_round()
                 
-                # Safety check
-                if self.state_machine.round > self.state_machine.max_rounds:
+                # Safety check: if a state path consumes the budget without
+                # transitioning itself, move to final synthesis. Do not rewrite
+                # DONE after a valid FINAL_CONCLUSION -> DONE transition.
+                if (
+                    self.state_machine.round >= self.state_machine.max_rounds
+                    and self.state_machine.state
+                    not in (SAGEState.FINAL_CONCLUSION, SAGEState.DONE)
+                ):
                     self._force_conclude()
-                    break
             
             self.execution_stats["end_time"] = time.time()
             return self._compile_results()
@@ -359,6 +364,9 @@ class SAGEController:
         为所有活跃假设同时执行一个步骤（DESIGN_TEST/ANALYZE_RESULT/UPDATE_HYPOTHESIS）
         每个假设独立维护自己的状态和循环
         """
+        if self._parallel_round_budget_exhausted("entry"):
+            return True
+
         if not self.variant_config.active_testing:
             self._record_action(
                 "variant_skip",
@@ -411,6 +419,9 @@ class SAGEController:
         
         # 为每个活跃假设执行一个步骤
         for hypothesis in active_hypotheses:
+            if self._parallel_round_budget_exhausted("before_hypothesis_step"):
+                return True
+
             if (
                 getattr(self.variant_config, "enable_global_steering_synthesis", False)
                 and getattr(self.state_machine, "global_steering_triggered", False)
@@ -455,7 +466,55 @@ class SAGEController:
         
         # All假设处理完成后，继续保持在PARALLEL_HYPOTHESIS_TESTING状态
         # 下一轮会自动再次处理所有活跃假设
+        self._advance_parallel_round()
         return True
+
+    def _parallel_round_budget_exhausted(self, where: str) -> bool:
+        """Stop active testing once the global round budget is consumed."""
+        if self.state_machine.round < self.state_machine.max_rounds:
+            return False
+
+        if self.state_machine.state != SAGEState.FINAL_CONCLUSION:
+            print(
+                f"⚠️  Max round ({self.state_machine.max_rounds}) reached during "
+                f"parallel testing at {where}. Moving to final conclusion."
+            )
+            self._record_action(
+                "parallel_round_budget_exhausted",
+                state=self.state_machine.state.value,
+                round=self.state_machine.round,
+                max_rounds=self.state_machine.max_rounds,
+                where=where,
+            )
+            self.state_machine.state = SAGEState.FINAL_CONCLUSION
+        return True
+
+    def _advance_parallel_round(self) -> None:
+        """Count one same-state parallel testing pass against max_rounds."""
+        if self.state_machine.state != SAGEState.PARALLEL_HYPOTHESIS_TESTING:
+            return
+
+        self.state_machine.round += 1
+        active_count = len(self.state_machine.get_active_hypotheses())
+        print(
+            f"🔁 Completed parallel testing pass "
+            f"({self.state_machine.round}/{self.state_machine.max_rounds}); "
+            f"active hypotheses: {active_count}"
+        )
+        self._record_action(
+            "parallel_round_advanced",
+            state=self.state_machine.state.value,
+            round=self.state_machine.round,
+            max_rounds=self.state_machine.max_rounds,
+            active_hypotheses=active_count,
+        )
+
+        if self.state_machine.round >= self.state_machine.max_rounds:
+            print(
+                f"⚠️  Max round ({self.state_machine.max_rounds}) reached after "
+                "parallel testing pass. Moving to final conclusion."
+            )
+            self.state_machine.state = SAGEState.FINAL_CONCLUSION
     
     def _process_hypothesis_design_test(self, hypothesis: Hypothesis):
         """为单个假设执行DESIGN_TEST步骤"""

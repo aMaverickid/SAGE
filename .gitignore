@@ -47,6 +47,7 @@ analysis*/
 output/
 cache/
 *smoke*
+!scripts/_smoke_controller_termination.py
 test_api.py
 
 # Local backups

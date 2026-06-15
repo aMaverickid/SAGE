@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -111,6 +112,7 @@ from scripts.prepare_random_amps import (  # noqa: E402
 
 DEFAULT_RESULTS_ROOT = REPO_ROOT / "results"
 DEFAULT_ANALYSIS_OUTPUT_DIR = REPO_ROOT / "analysis_eval_metrics_all"
+LAYER_OUTPUT_DIR = "layers"
 PREDICTIVE_INPUT_FIELDS = {
     "predictive_accuracy",
     "predictive_p_value",
@@ -781,6 +783,22 @@ def _predictive_input_block(predictive: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _metric_summary_for_rows(
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Build the metric summary JSON payload from feature-level rows."""
+    return {
+        "input": _summarize(rows, "input"),
+        "input_predictive": _summarize(
+            rows,
+            "input",
+            score_field="predictive_accuracy",
+            fallback_field="__missing__",
+        ),
+        "output": _summarize(rows, "output"),
+    }
+
+
 def _write_metric_outputs(
     args: argparse.Namespace,
     output_dir: Path,
@@ -792,15 +810,7 @@ def _write_metric_outputs(
     rows_path = output_dir / f"input_output_rows{suffix}{infix}.json"
     summary_path = output_dir / f"input_output_summary{suffix}{infix}.json"
     summary_csv = output_dir / f"input_output_summary{suffix}{infix}.csv"
-    summary = {
-        "input": _summarize(rows, "input"),
-        "input_predictive": _summarize(
-            rows, "input",
-            score_field="predictive_accuracy",
-            fallback_field="__missing__",
-        ),
-        "output": _summarize(rows, "output"),
-    }
+    summary = _metric_summary_for_rows(rows)
     _write_json_atomic(rows_path, rows)
     _write_json_atomic(summary_path, summary)
     _write_summary_csv(summary_csv, summary)
@@ -1094,6 +1104,61 @@ EFFICIENCY_FIELDS = [
 ]
 
 
+def _extract_layer_index(value: Any) -> Optional[int]:
+    """Return a numeric layer index from common SAGE/Neuronpedia labels."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    match = re.match(r"^(?:layer[_-]?)?(\d+)(?:\b|[_-])", text)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\blayer[_-]?(\d+)\b", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _layer_key_from_value(value: Any) -> str:
+    layer = _extract_layer_index(value)
+    return f"layer_{layer}" if layer is not None else "layer_unknown"
+
+
+def _layer_key_from_eval_row(row: Dict[str, Any]) -> str:
+    for value in (row.get("source"), row.get("layer_index"), row.get("layer")):
+        key = _layer_key_from_value(value)
+        if key != "layer_unknown":
+            return key
+    return "layer_unknown"
+
+
+def _layer_key_from_result(data: Dict[str, Any]) -> str:
+    spec = data.get("feature_spec") or {}
+    for value in (
+        data.get("layer_index"),
+        data.get("layer"),
+        spec.get("layer_index"),
+        spec.get("layer"),
+        spec.get("source"),
+    ):
+        key = _layer_key_from_value(value)
+        if key != "layer_unknown":
+            return key
+    return "layer_unknown"
+
+
+def _layer_sort_key(layer_key: str) -> Tuple[int, Any]:
+    layer = _extract_layer_index(layer_key)
+    if layer is not None:
+        return (0, layer)
+    return (1, layer_key)
+
+
 def _build_ranking(
     summary: Dict[str, Dict[str, Dict[str, float]]],
     rank_by: str,
@@ -1150,6 +1215,106 @@ def _write_ranking_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow({k: row.get(k, "") for k in fields})
 
 
+def _load_rows_for_layer_outputs(
+    output_dir: Path,
+    suffix: str,
+) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
+    """Load final rows for layer slices, falling back to checkpoints."""
+    final_rows = _final_rows_path(output_dir, suffix)
+    rows = _load_json_rows(final_rows)
+    if rows:
+        return rows, final_rows
+
+    partial_json, partial_jsonl = _partial_paths(output_dir, suffix)
+    rows = _load_json_rows(partial_json)
+    if rows:
+        return rows, partial_json
+
+    rows = _load_jsonl_rows(partial_jsonl)
+    if rows:
+        merged = list(_merge_resume_rows(rows).values())
+        return merged, partial_jsonl
+    return [], None
+
+
+def _write_layer_outputs(
+    args: argparse.Namespace,
+    output_dir: Path,
+    rows: List[Dict[str, Any]],
+    variants: List[str],
+) -> None:
+    """Write per-layer rows, summaries, and rankings under output_dir/layers."""
+    if not rows:
+        print("⚠  No feature rows available for per-layer outputs.")
+        return
+
+    suffix = args.output_suffix or ""
+    by_layer: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_layer.setdefault(_layer_key_from_eval_row(row), []).append(row)
+    if not by_layer:
+        print("⚠  Could not infer any layers from feature rows.")
+        return
+
+    layer_root = output_dir / LAYER_OUTPUT_DIR
+    layer_root.mkdir(parents=True, exist_ok=True)
+    index_rows: List[Dict[str, Any]] = []
+    for layer_key, layer_rows in sorted(
+        by_layer.items(), key=lambda item: _layer_sort_key(item[0])
+    ):
+        layer_dir = layer_root / layer_key
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        layer_rows = sorted(
+            layer_rows,
+            key=lambda row: (
+                str(row.get("variant", "")),
+                str(row.get("model", "")),
+                str(row.get("source", "")),
+                int(row.get("feature", -1)),
+            ),
+        )
+        summary = _metric_summary_for_rows(layer_rows)
+        efficiency = _summarize_efficiency(
+            Path(args.results_root),
+            variants,
+            Path(args.manifest_path) if args.manifest_path else None,
+            layer_key=layer_key,
+        )
+        ranking = _build_ranking(summary, args.rank_by, efficiency=efficiency)
+
+        _write_json_atomic(layer_dir / f"input_output_rows{suffix}.json", layer_rows)
+        _write_json_atomic(layer_dir / f"input_output_summary{suffix}.json", summary)
+        _write_summary_csv(
+            layer_dir / f"input_output_summary{suffix}.csv",
+            summary,
+        )
+        _write_ranking_csv(layer_dir / f"ranking{suffix}.csv", ranking)
+
+        sources = sorted({str(row.get("source", "")) for row in layer_rows})
+        index_rows.append({
+            "layer": layer_key,
+            "directory": str(Path(LAYER_OUTPUT_DIR) / layer_key),
+            "rows": len(layer_rows),
+            "variants": len({str(row.get("variant", "")) for row in layer_rows}),
+            "sources": ";".join(sources),
+        })
+        print(
+            f"Wrote per-layer outputs for {layer_key}: "
+            f"{len(layer_rows)} rows → {layer_dir}"
+        )
+
+    _write_layer_index_csv(layer_root / f"index{suffix}.csv", index_rows)
+
+
+def _write_layer_index_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    fields = ["layer", "directory", "rows", "variants", "sources"]
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+
+
 def _print_ranking(rows: List[Dict[str, Any]], rank_by: str) -> None:
     print("\n" + "=" * 128)
     print(
@@ -1187,6 +1352,7 @@ def _summarize_efficiency(
     results_root: Path,
     variants: List[str],
     manifest_path: Optional[Path] = None,
+    layer_key: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Aggregate generation-time efficiency from structured result files."""
     wanted = set(variants)
@@ -1201,6 +1367,8 @@ def _summarize_efficiency(
             continue
         variant = _infer_result_variant(results_root, sr_path, data)
         if wanted and variant not in wanted:
+            continue
+        if layer_key is not None and _layer_key_from_result(data) != layer_key:
             continue
         if wanted_features is not None:
             spec = data.get("feature_spec") or {}
@@ -1246,6 +1414,8 @@ def _summarize_efficiency(
             continue
         variant = _infer_result_variant(results_root, skip_path, data)
         if wanted and variant not in wanted:
+            continue
+        if layer_key is not None and _layer_key_from_result(data) != layer_key:
             continue
         if wanted_features is not None:
             spec = data.get("feature_spec") or {}
@@ -1399,6 +1569,13 @@ def main() -> None:
     _write_ranking_csv(csv_path, rows)
     _print_ranking(rows, args.rank_by)
     print(f"\nWrote {csv_path}")
+
+    eval_rows, row_source = _load_rows_for_layer_outputs(
+        output_dir, args.output_suffix or ""
+    )
+    if row_source is not None:
+        print(f"Building per-layer outputs from {row_source}")
+    _write_layer_outputs(args, output_dir, eval_rows, variants)
 
 
 if __name__ == "__main__":
