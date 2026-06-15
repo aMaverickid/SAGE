@@ -159,6 +159,9 @@ class SAGEStateMachine:
         
         self.state = new_state
         self.round += 1
+
+        if self.state == SAGEState.DONE:
+            return True
         
         # Forced termination condition
         if self.round >= self.max_rounds:

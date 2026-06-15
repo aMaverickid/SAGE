@@ -83,6 +83,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input_jobs", type=int, default=8)
     parser.add_argument("--llm_jobs", type=int, default=3)
+    parser.add_argument(
+        "--input_backend",
+        choices=["api", "local"],
+        default="api",
+        help="Input metric activation backend. Use local when Neuronpedia "
+             "custom activation is unavailable for a model/source.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--generation_device", default="cpu")
     parser.add_argument("--max_rounds", type=int, default=14)
@@ -126,6 +133,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force_generate", action="store_true")
     parser.add_argument("--skip_output", action="store_true")
     parser.add_argument("--skip_input", action="store_true")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Generation stage: enable verbose controller logs in per-task log files.",
+    )
+    parser.add_argument(
+        "--api_debug",
+        action="store_true",
+        help="Generation stage: enable compact Neuronpedia API debug logs.",
+    )
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
 
@@ -229,6 +246,10 @@ def _generate_cmd(args: argparse.Namespace) -> List[str]:
     _add_resume_flags(cmd, args)
     if args.force_generate:
         cmd.append("--force")
+    if args.debug:
+        cmd.append("--debug")
+    if args.api_debug:
+        cmd.append("--api_debug")
     return cmd
 
 
@@ -238,7 +259,7 @@ def _input_eval_cmd(args: argparse.Namespace) -> List[str]:
         "--metric",
         "input",
         "--input_backend",
-        "api",
+        args.input_backend,
         "--llm_model",
         args.judge_llm,
         "--jobs",
@@ -248,6 +269,15 @@ def _input_eval_cmd(args: argparse.Namespace) -> List[str]:
         "--rank_by",
         _input_rank_by(args),
     ])
+    if args.input_backend == "local":
+        cmd.extend([
+            "--target_llm",
+            args.target_llm,
+            "--sae_path",
+            args.sae_path,
+            "--device",
+            args.device,
+        ])
     if "input_predictive" in args.selected_metrics:
         cmd.extend([
             "--input_predictive",
