@@ -126,6 +126,20 @@ def parse_args() -> argparse.Namespace:
              "ignored when it does (layer parsed from each feature's source).",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Local HookedSAETransformer/SAE dtype. Keep float32 for the "
+             "original Gemma setup; use bfloat16/float16 for larger models.",
+    )
+    parser.add_argument(
+        "--model_backend",
+        choices=["auto", "hooked", "hf"],
+        default="auto",
+        help="Local model backend. auto keeps Gemma on TransformerLens but "
+             "uses a lightweight HF hook backend for gpt-oss.",
+    )
 
     parser.add_argument(
         "--n_examples", type=int, default=DEFAULT_N_EXAMPLES,
@@ -265,6 +279,8 @@ def _maybe_build_pool(args: argparse.Namespace) -> Optional[SAEPool]:
         target_llm=args.target_llm,
         sae_path_template=template,
         device=args.device,
+        dtype=getattr(args, "dtype", "float32"),
+        model_backend=getattr(args, "model_backend", "auto"),
     )
 
 

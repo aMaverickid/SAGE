@@ -69,7 +69,8 @@ def _gen_hook(clean_act, hook, sae, feature: int, value: float):  # noqa: ARG001
     dirty = sae.decode(encoded)
     error_term = clean_act - dirty
     encoded[:, :, feature] = value
-    return sae.decode(encoded) + error_term
+    steered = sae.decode(encoded) + error_term
+    return steered.to(dtype=clean_act.dtype)
 
 
 def _kl_div(p, q, eps: float = 1e-10):
@@ -95,8 +96,8 @@ def get_kl_div(
     else:
         clean_logits = model.run_with_saes(toks, saes=[sae])
         hooked_logits = model.run_with_hooks_with_saes(toks, saes=[sae], fwd_hooks=fwd_hooks)
-    clean_probs = clean_logits.softmax(dim=-1)
-    hooked_probs = hooked_logits.softmax(dim=-1)
+    clean_probs = clean_logits.float().softmax(dim=-1)
+    hooked_probs = hooked_logits.float().softmax(dim=-1)
     clean_probs[toks == 0] = 0
     hooked_probs[toks == 0] = 0
     kl = _kl_div(clean_probs, hooked_probs)

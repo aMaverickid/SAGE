@@ -235,6 +235,10 @@ def save_final_text_artifacts(results: Dict[str, Any], path2save: str) -> None:
     for filename, content in artifacts.items():
         with open(os.path.join(path2save, filename), "w", encoding="utf-8") as f:
             f.write(content.strip() + ("\n" if content.strip() else ""))
+    for stale_filename in ("skipped_log.json", "error_log.json"):
+        stale_path = os.path.join(path2save, stale_filename)
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
 
 
 def clear_previous_result_artifacts(path2save: str) -> None:

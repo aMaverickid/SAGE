@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 AUTO_SENTINEL = "auto"
@@ -168,20 +169,20 @@ class SAEPool:
 
     def __init__(
         self, target_llm: str, sae_path_template: str, device: str = "cuda",
-        dtype: str = "float32",
+        dtype: str = "float32", model_backend: str = "auto",
     ) -> None:
-        """``dtype`` defaults to ``float32`` because TransformerLens's
-        attention path (and SAELens encode/decode round-trips inside
-        steering hooks) cannot tolerate Half/Float mixing — loading the
-        SAE in fp16 still upcasts internally (JumpReLU threshold compare,
-        b_dec, etc.), then the residual stream re-enters fp32 attention
-        and trips ``q_ @ k_``. fp32 throughout is the only consistent
-        path; on an 80GB A800 a 2B model + 16k SAE fits easily.
+        """Create a lazy local model/SAE cache.
+
+        ``dtype`` defaults to ``float32`` to preserve the original Gemma eval
+        behavior. Larger models such as gpt-oss-20b generally need
+        ``bfloat16`` or ``float16`` to avoid a very large CPU-side
+        TransformerLens conversion and an oversized final GPU model.
         """
         self.target_llm = target_llm
         self.sae_path_template = sae_path_template
         self.device = device
         self.dtype: str = dtype
+        self.model_backend = model_backend
         self._model: Any = None
         self._cache: Dict[Tuple[str, str], Tuple[Any, int]] = {}
 
@@ -233,13 +234,50 @@ class SAEPool:
         the model + SAE independently lets the SAELens exception propagate
         with its actual message.
         """
+        backend = self._resolved_model_backend()
+        if backend == "hf":
+            from eval_metrics.hf_steering_backend import HFCausalLMHookWrapper
+            print(
+                f"⟳ Loading HF hook backend: {self.target_llm} → "
+                f"{self.device} ({self.dtype})",
+                flush=True,
+            )
+            self._model = HFCausalLMHookWrapper(
+                self.target_llm,
+                device=str(self.device),
+                dtype=self.dtype,
+            )
+            print(f"✓ Loaded HF hook backend: {self.target_llm}", flush=True)
+            return
+
         from sae_lens import HookedSAETransformer  # type: ignore
-        print(f"⟳ Loading LLM: {self.target_llm} → {self.device} ({self.dtype})")
+        if "gpt-oss" in self.target_llm.lower() and self.dtype == "float32":
+            print(
+                "⚠ Loading gpt-oss in float32 can spend a long time converting "
+                "weights on CPU and may exceed a single 80GB GPU. Consider "
+                "--dtype bfloat16.",
+                flush=True,
+            )
+        print(
+            f"⟳ Loading LLM: {self.target_llm} → {self.device} ({self.dtype})",
+            flush=True,
+        )
         self._model = HookedSAETransformer.from_pretrained(
             model_name=self.target_llm,
             device=str(self.device),
             dtype=self.dtype,
         )
+        print(f"✓ Loaded LLM: {self.target_llm}", flush=True)
+
+    def _resolved_model_backend(self) -> str:
+        if self.model_backend != "auto":
+            return self.model_backend
+        target = self.target_llm.lower()
+        if Path(self.target_llm).exists():
+            return "hf"
+        if "gpt-oss" in target or "llama" in target:
+            return "hf"
+        return "hooked"
 
     def _load_sae(self, release: str, sae_id: str, layer: int) -> Any:
         """Load one SAE via :func:`sae_lens.SAE.from_pretrained`.

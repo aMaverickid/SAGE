@@ -209,6 +209,20 @@ def parse_args() -> argparse.Namespace:
              "placeholder (single-layer mode).",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Local HookedSAETransformer/SAE dtype. Keep float32 for the "
+             "original Gemma setup; use bfloat16/float16 for larger models.",
+    )
+    parser.add_argument(
+        "--model_backend",
+        choices=["auto", "hooked", "hf"],
+        default="auto",
+        help="Local model backend. auto keeps Gemma on TransformerLens but "
+             "uses a lightweight HF hook backend for gpt-oss.",
+    )
 
     parser.add_argument("--random_pool_dir", default=str(DEFAULT_RANDOM_POOL_DIR))
     parser.add_argument("--pool_num", type=int, default=10)
@@ -307,6 +321,8 @@ def _eval_args_for(args: argparse.Namespace, variants: List[str]) -> argparse.Na
         sae_path=args.sae_path,
         layer=args.layer,
         device=args.device,
+        dtype=args.dtype,
+        model_backend=args.model_backend,
         n_examples=args.n_examples,
         threshold_mode=args.threshold_mode,
         threshold_factor=args.threshold_factor,
@@ -1408,6 +1424,14 @@ def _summarize_efficiency(
     for skip_path in results_root.rglob("skipped_log.json"):
         if skip_path.parent in seen_skipped_dirs:
             continue
+        sr_path = skip_path.parent / "structured_results.json"
+        if sr_path.exists():
+            try:
+                sr_data = json.loads(sr_path.read_text())
+            except Exception:
+                sr_data = None
+            if sr_data is not None and not is_skipped_result(sr_path, sr_data):
+                continue
         try:
             data = json.loads(skip_path.read_text())
         except Exception:
