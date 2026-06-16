@@ -168,7 +168,10 @@ class ExperimentEnvironment:
 
                         if detailed_exemplars:
                             # Check if all activations are negative (suppression rather than activation)
-                            all_negative = all(ex["max_activation"] < 0 for ex in detailed_exemplars)
+                            all_negative = all(
+                                float(ex.get("max_activation", 0.0) or 0.0) < 0
+                                for ex in detailed_exemplars
+                            )
                             if all_negative:
                                 outputs.append(f"WARNING: All {len(detailed_exemplars)} corpus samples show NEGATIVE activation (suppression). This feature may be inactive on the current corpus.")
                                 outputs.append("Consider:")
@@ -182,12 +185,11 @@ class ExperimentEnvironment:
                             
                             # Format detailed exemplars with token-level information (limit to 5 for context)
                             for i, exemplar in enumerate(detailed_exemplars[:10], 1):
-                                text = exemplar["text"]
-                                max_act = exemplar["max_activation"]
-                                mean_act = exemplar["mean_activation"]
-                                tokens = exemplar["tokens"]
-                                per_token_acts = exemplar["per_token_activations"]
-                                max_token_idx = exemplar["max_token_index"]
+                                text = exemplar.get("text", "")
+                                max_act = float(exemplar.get("max_activation", 0.0) or 0.0)
+                                mean_act = float(exemplar.get("mean_activation", 0.0) or 0.0)
+                                tokens = exemplar.get("tokens", []) or []
+                                per_token_acts = exemplar.get("per_token_activations", []) or []
                                 
                                 # Basic exemplar info (ultra-simplified for context length)
                                 outputs.append(f"\n{i}. max_activation={max_act:.4f}, mean_activation={mean_act:.4f}")

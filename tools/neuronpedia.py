@@ -431,14 +431,35 @@ class NeuronpediaManager:
                 if not isinstance(activation_obj, dict):
                     continue
                 
-                # Extract tokens and values
-                tokens = activation_obj.get('tokens', [])
-                values = activation_obj.get('values', [])
-                
-                # Find max activation in this example
-                max_val = 0.0
-                if values:
-                    max_val = max(values)
+                # Extract tokens and values. Different Neuronpedia sources
+                # expose the same exemplar schema with slightly different
+                # optional fields, so normalize it before handing it to the
+                # controller/environment layer.
+                tokens = list(activation_obj.get('tokens') or [])
+                raw_values = activation_obj.get('values') or []
+                values = [float(v) for v in raw_values]
+
+                max_token_index = int(
+                    activation_obj.get('maxValueTokenIndex') or 0
+                )
+                if values and (
+                    max_token_index < 0 or max_token_index >= len(values)
+                ):
+                    max_token_index = max(
+                        range(len(values)),
+                        key=lambda idx: values[idx],
+                    )
+
+                raw_max = activation_obj.get('maxValue')
+                if raw_max is not None:
+                    max_val = float(raw_max)
+                elif values:
+                    max_val = float(max(values))
+                else:
+                    max_val = 0.0
+
+                mean_val = float(sum(values) / len(values)) if values else 0.0
+                sum_val = float(sum(values)) if values else 0.0
                 
                 # Reconstruct text
                 text = "".join(tokens)
@@ -450,8 +471,13 @@ class NeuronpediaManager:
                     detailed_exemplars.append({
                         'text': text,
                         'max_activation': max_val,
+                        'mean_activation': mean_val,
+                        'sum_activation': sum_val,
                         'tokens': tokens,
-                        'per_token_activations': values
+                        'per_token_activations': values,
+                        'max_token_index': max_token_index,
+                        'layer': layer,
+                        'feature_index': feature_index,
                     })
             
             # Sort by activation
