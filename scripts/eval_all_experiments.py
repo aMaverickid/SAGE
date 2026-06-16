@@ -193,6 +193,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictive_buffer_size", type=int, default=DEFAULT_PREDICTIVE_BUFFER_SIZE)
     parser.add_argument("--predictive_top_logprobs", type=int, default=DEFAULT_PREDICTIVE_TOP_LOGPROBS)
     parser.add_argument("--n_new", type=int, default=25)
+    parser.add_argument(
+        "--output_repeats",
+        type=int,
+        default=1,
+        help="Number of repeated Output Score evaluations per feature. "
+             "Repeated runs are averaged into a feature-level score before "
+             "variant-level aggregation.",
+    )
 
     parser.add_argument("--target_llm", default=None)
     parser.add_argument(
@@ -272,7 +280,21 @@ def parse_args() -> argparse.Namespace:
         help="Debug helper: evaluate at most this many feature rows after "
              "filtering/resume.",
     )
+    parser.add_argument(
+        "--paired_ci_baseline",
+        default=None,
+        help="Optional baseline variant for paired bootstrap CI outputs. "
+             "Differences are computed per matched feature.",
+    )
+    parser.add_argument(
+        "--paired_ci_bootstrap_samples",
+        type=int,
+        default=50000,
+        help="Number of bootstrap samples for paired CI outputs.",
+    )
     args = parser.parse_args()
+    if args.output_repeats < 1:
+        parser.error("--output_repeats must be >= 1")
     if args.eval_text:
         args.label_filename = eval_text_source_to_filename(args.eval_text)
     if args.metric in ("input", "both") and not args.input_generative and not args.input_predictive:
@@ -340,6 +362,7 @@ def _eval_args_for(args: argparse.Namespace, variants: List[str]) -> argparse.Na
         predictive_buffer_size=args.predictive_buffer_size,
         predictive_top_logprobs=args.predictive_top_logprobs,
         n_new=args.n_new,
+        output_repeats=args.output_repeats,
         label_filename=args.label_filename,
         label_strategy=args.label_strategy,
         skip_pool=args.skip_pool,
@@ -351,6 +374,8 @@ def _eval_args_for(args: argparse.Namespace, variants: List[str]) -> argparse.Na
         retry_failed=args.retry_failed,
         force_eval=args.force_eval,
         limit=args.limit,
+        paired_ci_baseline=args.paired_ci_baseline,
+        paired_ci_bootstrap_samples=args.paired_ci_bootstrap_samples,
     )
 
 
@@ -497,6 +522,18 @@ def _has_metric(row: Optional[Dict[str, Any]], metric: str) -> bool:
     return isinstance((row or {}).get(metric), dict)
 
 
+def _has_requested_output_result(
+    row: Optional[Dict[str, Any]], args: argparse.Namespace,
+) -> bool:
+    block = (row or {}).get("output")
+    if not isinstance(block, dict):
+        return False
+    requested = int(getattr(args, "output_repeats", 1) or 1)
+    if requested <= 1:
+        return True
+    return int(block.get("num_repeats", 1) or 1) >= requested
+
+
 def _has_input_generative_result(block: Dict[str, Any]) -> bool:
     for key in ("score", "accuracy_high", "success", "pos_act_toks", "pos_act_all"):
         if key in block and block.get(key) is not None:
@@ -556,6 +593,12 @@ def _should_skip_for_metric(
         if row.get("input_error") and not retry_failed:
             return True
         return False
+    if metric == "output" and args is not None:
+        if _has_requested_output_result(row, args):
+            return True
+        if row.get("output_error") and not retry_failed:
+            return True
+        return False
     if _has_metric(row, metric):
         return True
     if row.get(f"{metric}_error") and not retry_failed:
@@ -598,6 +641,7 @@ def _metric_config(args: argparse.Namespace) -> Dict[str, Any]:
         "predictive_buffer_size": args.predictive_buffer_size,
         "predictive_top_logprobs": args.predictive_top_logprobs,
         "n_new": args.n_new,
+        "output_repeats": int(getattr(args, "output_repeats", 1)),
         "random_pool_dir": args.random_pool_dir,
         "eval_text": eval_text,
         "label_filename": args.label_filename,
@@ -834,6 +878,181 @@ def _write_metric_outputs(
         _print_summary_table(summary)
         print(f"\nWrote rows to {rows_path}")
         print(f"Wrote summary to {summary_path} and {summary_csv}")
+        _write_paired_ci_outputs(args, output_dir, rows)
+
+
+def _write_paired_ci_outputs(
+    args: argparse.Namespace,
+    output_dir: Path,
+    rows: List[Dict[str, Any]],
+) -> None:
+    baseline = getattr(args, "paired_ci_baseline", None)
+    if not baseline:
+        return
+    results: List[Dict[str, Any]] = []
+    for metric, score_field, fallback_field in (
+        ("input", "score", "success"),
+        ("input_predictive", "predictive_accuracy", "__missing__"),
+        ("output", "score", "success"),
+    ):
+        results.extend(_paired_ci_for_metric(
+            rows=rows,
+            metric=metric,
+            baseline=str(baseline),
+            score_field=score_field,
+            fallback_field=fallback_field,
+            n_boot=max(1, int(getattr(args, "paired_ci_bootstrap_samples", 50000))),
+            seed=int(getattr(args, "seed", 0)),
+        ))
+    suffix = args.output_suffix or ""
+    json_path = output_dir / f"paired_bootstrap_ci{suffix}.json"
+    csv_path = output_dir / f"paired_bootstrap_ci{suffix}.csv"
+    _write_json_atomic(json_path, results)
+    _write_paired_ci_csv(csv_path, results)
+    if results:
+        print(f"Wrote paired bootstrap CIs to {json_path} and {csv_path}")
+
+
+def _paired_ci_for_metric(
+    rows: List[Dict[str, Any]],
+    metric: str,
+    baseline: str,
+    score_field: str,
+    fallback_field: str,
+    n_boot: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    by_variant: Dict[str, Dict[Tuple[str, str, int], float]] = {}
+    for row in rows:
+        block = row.get("input") if metric == "input_predictive" else row.get(metric)
+        value = _metric_value(block, score_field, fallback_field)
+        if value is None:
+            continue
+        key = (
+            str(row.get("model", "")),
+            str(row.get("source", "")),
+            int(row.get("feature", -1)),
+        )
+        by_variant.setdefault(str(row.get("variant", "")), {})[key] = value
+    base = by_variant.get(baseline, {})
+    if not base:
+        return []
+    out: List[Dict[str, Any]] = []
+    for variant, table in sorted(by_variant.items()):
+        if variant == baseline:
+            continue
+        keys = sorted(set(base) & set(table))
+        if not keys:
+            continue
+        baseline_vals = [base[key] for key in keys]
+        variant_vals = [table[key] for key in keys]
+        diffs = [v - b for b, v in zip(baseline_vals, variant_vals)]
+        lo, hi = _bootstrap_ci(diffs, seed=seed, n_boot=n_boot)
+        p = _wilcoxon_p(diffs)
+        out.append({
+            "metric": metric,
+            "baseline": baseline,
+            "variant": variant,
+            "n": len(keys),
+            "baseline_mean": sum(baseline_vals) / len(baseline_vals),
+            "variant_mean": sum(variant_vals) / len(variant_vals),
+            "delta_mean": sum(diffs) / len(diffs),
+            "ci_low": lo,
+            "ci_high": hi,
+            "wilcoxon_p": p,
+            "bootstrap_samples": n_boot,
+            "unit": "matched_feature",
+        })
+    return out
+
+
+def _metric_value(
+    block: Any,
+    score_field: str,
+    fallback_field: str,
+) -> Optional[float]:
+    if not isinstance(block, dict):
+        return None
+    value = block.get(score_field)
+    if value is not None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    value = block.get(fallback_field)
+    if value is not None:
+        return 1.0 if bool(value) else 0.0
+    return None
+
+
+def _bootstrap_ci(
+    diffs: List[float],
+    seed: int,
+    n_boot: int,
+) -> Tuple[float, float]:
+    if not diffs:
+        return 0.0, 0.0
+    rng = random.Random(seed)
+    m = len(diffs)
+    means = sorted(
+        sum(diffs[rng.randrange(m)] for _ in range(m)) / m
+        for _ in range(n_boot)
+    )
+    return means[int(0.025 * n_boot)], means[min(n_boot - 1, int(0.975 * n_boot))]
+
+
+def _wilcoxon_p(diffs: List[float]) -> float:
+    """Two-sided Wilcoxon signed-rank p-value with normal approximation."""
+    nz = [float(d) for d in diffs if float(d) != 0.0]
+    n = len(nz)
+    if n == 0:
+        return 1.0
+    order = sorted(range(n), key=lambda i: abs(nz[i]))
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and abs(nz[order[j + 1]]) == abs(nz[order[i]]):
+            j += 1
+        avg = (i + 1 + j + 1) / 2.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    w_plus = sum(ranks[i] for i in range(n) if nz[i] > 0)
+    mean_w = n * (n + 1) / 4.0
+    tie_counts: Dict[float, int] = {}
+    for d in nz:
+        tie_counts[abs(d)] = tie_counts.get(abs(d), 0) + 1
+    tie_term = sum(t ** 3 - t for t in tie_counts.values())
+    var_w = (n * (n + 1) * (2 * n + 1) - tie_term / 2.0) / 24.0
+    if var_w <= 0:
+        return 1.0
+    z = (w_plus - mean_w - _signed_half(w_plus - mean_w)) / (var_w ** 0.5)
+    # erfc is available from the math module, but importing lazily keeps the
+    # top-level import list stable for older scripts that copy this function.
+    import math
+    return min(1.0, math.erfc(abs(z) / (2 ** 0.5)))
+
+
+def _signed_half(value: float) -> float:
+    if value > 0:
+        return 0.5
+    if value < 0:
+        return -0.5
+    return 0.0
+
+
+def _write_paired_ci_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    fields = [
+        "metric", "baseline", "variant", "n", "baseline_mean",
+        "variant_mean", "delta_mean", "ci_low", "ci_high", "wilcoxon_p",
+        "bootstrap_samples", "unit",
+    ]
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
 
 
 def run_fast_input_api_eval(
@@ -967,8 +1186,43 @@ def _run_output_task(
             "source": str(task["source"]),
             "n_tokens": args.n_new,
         }
+        with llm_gate:
+            row["output"] = _run_repeated_output_score(
+                args=args,
+                task=task,
+                cache_root=cache_root,
+                pool_path=pool_path,
+                rng_seed=rng_seed,
+                api_kwargs=api_kwargs,
+                local_model=local_model,
+                local_sae=local_sae,
+                local_layer=local_layer,
+            )
+    except Exception as exc:
+        row["output_error"] = str(exc)
+        row["traceback"] = traceback.format_exc()
+    row["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return row
+
+
+def _run_repeated_output_score(
+    args: argparse.Namespace,
+    task: Dict[str, Any],
+    cache_root: Path,
+    pool_path: Path,
+    rng_seed: int,
+    api_kwargs: Dict[str, Any],
+    local_model: Any,
+    local_sae: Any,
+    local_layer: int,
+) -> Dict[str, Any]:
+    repeats = max(1, int(getattr(args, "output_repeats", 1) or 1))
+    force_eval = bool(getattr(args, "force_eval", False))
+    repeat_blocks: List[Dict[str, Any]] = []
+    for repeat_idx in range(repeats):
+        repeat_seed = _repeat_seed(rng_seed, repeat_idx)
         real_cache = judge_cache = None
-        if not bool(getattr(args, "force_eval", False)):
+        if not force_eval:
             real_cache, judge_cache = output_cache_paths(
                 cache_root=cache_root,
                 backend=args.output_backend,
@@ -978,32 +1232,48 @@ def _run_output_task(
                 feature=int(task["feature"]),
                 description=str(task["description"]),
                 n_new=args.n_new,
-                seed=rng_seed,
+                seed=repeat_seed,
                 pool_path=pool_path,
             )
-        rng = random.Random(rng_seed)
-        with llm_gate:
-            score = compute_output_score(
-                description=str(task["description"]),
-                feature=int(task["feature"]),
-                llm_model=args.llm_model,
-                pool_path=pool_path,
-                rng=rng,
-                backend=args.output_backend,
-                local_model=local_model,
-                local_sae=local_sae,
-                local_layer=local_layer,
-                n_new=args.n_new,
-                api_steer_kwargs=api_kwargs,
-                real_amps_cache=real_cache,
-                judge_cache=judge_cache,
-            )
-        row["output"] = score.to_dict()
-    except Exception as exc:
-        row["output_error"] = str(exc)
-        row["traceback"] = traceback.format_exc()
-    row["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    return row
+        score = compute_output_score(
+            description=str(task["description"]),
+            feature=int(task["feature"]),
+            llm_model=args.llm_model,
+            pool_path=pool_path,
+            rng=random.Random(repeat_seed),
+            backend=args.output_backend,
+            local_model=local_model,
+            local_sae=local_sae,
+            local_layer=local_layer,
+            n_new=args.n_new,
+            api_steer_kwargs=api_kwargs,
+            real_amps_cache=real_cache,
+            judge_cache=judge_cache,
+        )
+        block = score.to_dict()
+        block["repeat_index"] = repeat_idx
+        block["seed"] = repeat_seed
+        repeat_blocks.append(block)
+
+    successes = [1.0 if bool(block.get("success")) else 0.0 for block in repeat_blocks]
+    feature_score = sum(successes) / len(successes) if successes else 0.0
+    first = dict(repeat_blocks[0]) if repeat_blocks else {}
+    out = dict(first)
+    out["score"] = feature_score
+    out["success_rate"] = feature_score
+    out["success_count"] = int(sum(successes))
+    out["num_repeats"] = len(repeat_blocks)
+    out["success"] = feature_score >= 0.5
+    out["repeats"] = repeat_blocks
+    out["aggregation"] = "mean_success_over_repeated_output_evaluations"
+    return out
+
+
+def _repeat_seed(base_seed: int, repeat_idx: int) -> int:
+    if repeat_idx == 0:
+        return int(base_seed)
+    payload = f"{base_seed}|output-repeat|{repeat_idx}"
+    return int(hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8], 16)
 
 
 def run_checkpointed_output_eval(
@@ -1039,7 +1309,7 @@ def run_checkpointed_output_eval(
     for task in tasks:
         key = _task_key(task)
         if _should_skip_for_metric(
-            done_by_key.get(key), "output", args.retry_failed, args.force_eval,
+            done_by_key.get(key), "output", args.retry_failed, args.force_eval, args,
         ):
             skipped += 1
             continue
@@ -1599,6 +1869,7 @@ def main() -> None:
     )
     if row_source is not None:
         print(f"Building per-layer outputs from {row_source}")
+        _write_paired_ci_outputs(args, output_dir, eval_rows)
     _write_layer_outputs(args, output_dir, eval_rows, variants)
 
 

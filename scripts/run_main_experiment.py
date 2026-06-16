@@ -112,6 +112,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool_num", type=int, default=10)
     parser.add_argument("--n_new", type=int, default=25)
     parser.add_argument(
+        "--output_repeats",
+        type=int,
+        default=1,
+        help="Number of repeated Output Score evaluations per feature. "
+             "Repeated runs are averaged at the feature level before "
+             "variant-level aggregation.",
+    )
+    parser.add_argument(
         "--metrics",
         default="input,output",
         help="Comma-separated eval metrics to run: input, input_predictive, "
@@ -127,6 +135,18 @@ def parse_args() -> argparse.Namespace:
         "--rank_by",
         choices=["input", "input_predictive", "output", "combined"],
         default="combined",
+    )
+    parser.add_argument(
+        "--paired_ci_baseline",
+        default="full",
+        help="Baseline variant for paired bootstrap CI outputs. Use an empty "
+             "string to disable CI file generation.",
+    )
+    parser.add_argument(
+        "--paired_ci_bootstrap_samples",
+        type=int,
+        default=50000,
+        help="Number of feature-level bootstrap samples for paired CI outputs.",
     )
     parser.add_argument(
         "--eval_mode",
@@ -343,6 +363,8 @@ def _output_eval_cmd(args: argparse.Namespace) -> List[str]:
         str(args.pool_num),
         "--n_new",
         str(args.n_new),
+        "--output_repeats",
+        str(args.output_repeats),
         "--rank_by",
         args.rank_by,
     ])
@@ -387,7 +409,7 @@ def _shes_cmd(args: argparse.Namespace) -> List[str]:
 
 
 def _eval_base_cmd(args: argparse.Namespace) -> List[str]:
-    return [
+    cmd = [
         sys.executable,
         "scripts/eval_all_experiments.py",
         "--results_root",
@@ -403,6 +425,14 @@ def _eval_base_cmd(args: argparse.Namespace) -> List[str]:
         "--label_strategy",
         args.label_strategy,
     ]
+    if args.paired_ci_baseline:
+        cmd.extend([
+            "--paired_ci_baseline",
+            args.paired_ci_baseline,
+            "--paired_ci_bootstrap_samples",
+            str(args.paired_ci_bootstrap_samples),
+        ])
+    return cmd
 
 
 def _add_resume_flags(cmd: List[str], args: argparse.Namespace) -> None:

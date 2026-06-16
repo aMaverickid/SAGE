@@ -222,6 +222,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n_new", type=int, default=25,
                         help="Tokens generated per prompt in output metric")
+    parser.add_argument(
+        "--output_repeats",
+        type=int,
+        default=1,
+        help="Number of repeated Output Score evaluations per feature. "
+             "Repeated runs are averaged at feature level.",
+    )
 
     parser.add_argument(
         "--label_filename", default=DEFAULT_TEXT_FILENAME,
@@ -416,32 +423,50 @@ def _run_output(
     )
     pool_path = pool_path_for(Path(args.random_pool_dir), model, source)
     api_kwargs = {"model": model, "source": source, "n_tokens": args.n_new}
-    real_cache = judge_cache = None
     rng_seed = _stable_output_seed(args.seed, model, source, feature, description)
-    if cache_root is not None and not bool(getattr(args, "force_eval", False)):
-        real_cache, judge_cache = output_cache_paths(
-            cache_root=cache_root,
-            backend=args.output_backend,
+    repeats = max(1, int(getattr(args, "output_repeats", 1) or 1))
+    repeat_blocks: List[Dict[str, Any]] = []
+    for repeat_idx in range(repeats):
+        repeat_seed = _repeat_output_seed(rng_seed, repeat_idx)
+        real_cache = judge_cache = None
+        if cache_root is not None and not bool(getattr(args, "force_eval", False)):
+            real_cache, judge_cache = output_cache_paths(
+                cache_root=cache_root,
+                backend=args.output_backend,
+                llm_model=args.llm_model,
+                model=model,
+                source=source,
+                feature=feature,
+                description=description,
+                n_new=args.n_new,
+                seed=repeat_seed,
+                pool_path=pool_path,
+            )
+        score = compute_output_score(
+            description=description, feature=feature,
             llm_model=args.llm_model,
-            model=model,
-            source=source,
-            feature=feature,
-            description=description,
-            n_new=args.n_new,
-            seed=rng_seed,
-            pool_path=pool_path,
+            pool_path=pool_path, rng=random.Random(repeat_seed),
+            backend=args.output_backend,
+            local_model=local_model, local_sae=local_sae, local_layer=local_layer,
+            n_new=args.n_new, api_steer_kwargs=api_kwargs,
+            real_amps_cache=real_cache,
+            judge_cache=judge_cache,
         )
-    score = compute_output_score(
-        description=description, feature=feature,
-        llm_model=args.llm_model,
-        pool_path=pool_path, rng=random.Random(rng_seed),
-        backend=args.output_backend,
-        local_model=local_model, local_sae=local_sae, local_layer=local_layer,
-        n_new=args.n_new, api_steer_kwargs=api_kwargs,
-        real_amps_cache=real_cache,
-        judge_cache=judge_cache,
-    )
-    return score.to_dict()
+        block = score.to_dict()
+        block["repeat_index"] = repeat_idx
+        block["seed"] = repeat_seed
+        repeat_blocks.append(block)
+    successes = [1.0 if bool(block.get("success")) else 0.0 for block in repeat_blocks]
+    feature_score = sum(successes) / len(successes) if successes else 0.0
+    first = dict(repeat_blocks[0]) if repeat_blocks else {}
+    first["score"] = feature_score
+    first["success_rate"] = feature_score
+    first["success_count"] = int(sum(successes))
+    first["num_repeats"] = len(repeat_blocks)
+    first["success"] = feature_score >= 0.5
+    first["repeats"] = repeat_blocks
+    first["aggregation"] = "mean_success_over_repeated_output_evaluations"
+    return first
 
 
 def _stable_output_seed(
@@ -454,16 +479,22 @@ def _stable_output_seed(
     return int(hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8], 16)
 
 
+def _repeat_output_seed(base_seed: int, repeat_idx: int) -> int:
+    if repeat_idx == 0:
+        return int(base_seed)
+    payload = f"{base_seed}|output-repeat|{repeat_idx}"
+    return int(hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8], 16)
+
+
 def _summarize(
     rows: List[Dict[str, Any]], metric: str,
     score_field: str = "score", fallback_field: str = "success",
 ) -> Dict[str, Dict[str, float]]:
     """Per-variant aggregate for one metric.
 
-    Prefers a continuous ``score`` per row (e.g. accuracy_high for the
-    gen-accuracy Input metric). Falls back to the binary ``success`` flag
-    when no score is recorded (Output metric currently has no continuous
-    counterpart).
+    Prefers a continuous ``score`` per row, such as Input accuracy or repeated
+    Output success rate. Falls back to the binary ``success`` flag when no score
+    is recorded.
     """
     per_variant: Dict[str, List[float]] = {}
     for r in rows:
