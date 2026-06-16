@@ -91,6 +91,20 @@ def parse_args() -> argparse.Namespace:
              "custom activation is unavailable for a model/source.",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Local eval model/SAE dtype. For gpt-oss-20b output eval, "
+             "bfloat16 is usually the practical choice.",
+    )
+    parser.add_argument(
+        "--model_backend",
+        choices=["auto", "hooked", "hf"],
+        default="auto",
+        help="Local eval model backend. auto uses HF hooks for gpt-oss and "
+             "TransformerLens for the original Gemma setup.",
+    )
     parser.add_argument("--generation_device", default="cpu")
     parser.add_argument("--max_rounds", type=int, default=14)
     parser.add_argument("--top_k", type=int, default=10)
@@ -277,6 +291,10 @@ def _input_eval_cmd(args: argparse.Namespace) -> List[str]:
             args.sae_path,
             "--device",
             args.device,
+            "--dtype",
+            args.dtype,
+            "--model_backend",
+            args.model_backend,
         ])
     if "input_predictive" in args.selected_metrics:
         cmd.extend([
@@ -315,6 +333,10 @@ def _output_eval_cmd(args: argparse.Namespace) -> List[str]:
         args.sae_path,
         "--device",
         args.device,
+        "--dtype",
+        args.dtype,
+        "--model_backend",
+        args.model_backend,
         "--llm_model",
         args.judge_llm,
         "--pool_num",

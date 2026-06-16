@@ -360,14 +360,14 @@ def _filter_tasks(args: argparse.Namespace, tasks: List[Task]) -> List[Task]:
         done = (task.result_dir / "description.txt").exists()
         skipped = (task.result_dir / "skipped_log.json").exists()
         failed = (task.result_dir / "error_log.json").exists()
-        if done and (args.resume or args.retry_failed or args.retry_skipped):
-            skipped_done += 1
-            continue
         if skipped and args.retry_skipped:
             retrying_marked += 1
             if "--force" not in task.command:
                 task.command.append("--force")
             pending.append(task)
+            continue
+        if done and (args.resume or args.retry_failed or args.retry_skipped):
+            skipped_done += 1
             continue
         if skipped and (args.resume or args.retry_failed):
             skipped_marked += 1
@@ -447,10 +447,10 @@ def _write_timeout_skip(task: Task, timeout_minutes: Optional[float]) -> None:
 def _status_from_result(task: Task, returncode: int) -> str:
     if returncode != 0:
         return "failed"
-    if (task.result_dir / "skipped_log.json").exists():
-        return "skipped"
     if (task.result_dir / "description.txt").exists():
         return "completed"
+    if (task.result_dir / "skipped_log.json").exists():
+        return "skipped"
     if (task.result_dir / "error_log.json").exists():
         return "error"
     return "incomplete"

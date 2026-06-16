@@ -123,6 +123,15 @@ def load_feature_text(
     return ""
 
 
+def has_completed_feature_text(feature_dir: Path) -> bool:
+    """Return True when a feature directory has usable completed text."""
+    return any(
+        (feature_dir / filename).exists()
+        and (feature_dir / filename).read_text(encoding="utf-8").strip()
+        for filename in (DEFAULT_DESCRIPTION_FILENAME, DEFAULT_LABEL_FILENAME)
+    )
+
+
 def discover_variant_features(
     results_root: Path,
     variant_filter: Optional[List[str]] = None,
@@ -131,10 +140,11 @@ def discover_variant_features(
     """Walk ``results_root`` and group (model, source, feature_idx, feature_dir) by variant.
 
     A directory is treated as a variant iff it sits directly under
-    ``results_root`` and contains at least one ``structured_results.json``
-    with a populated ``feature_spec`` AND a sibling ``description.txt`` OR
-    ``labels.txt`` file. Features without any LLM-facing text are skipped
-    because there is nothing to evaluate.
+    ``results_root`` and contains at least one feature directory with
+    LLM-facing text. Standard SAGE outputs are discovered from
+    ``structured_results.json``. Neuronpedia baselines can also be discovered
+    from ``neuronpedia_feature.json`` when only imported descriptions are
+    present.
 
     The fourth element of each entry is the feature *directory* (not the
     description file); callers use :func:`load_feature_text` to read it,
@@ -150,10 +160,19 @@ def discover_variant_features(
         variant = variant_dir.name
         if variant_filter and variant not in variant_filter:
             continue
+        seen_dirs = set()
         for sr_path in variant_dir.rglob("structured_results.json"):
             entry = _entry_from_structured_results(sr_path, label_filename)
             if entry is not None:
                 out.setdefault(variant, []).append(entry)
+                seen_dirs.add(sr_path.parent)
+        for feature_dir in _iter_feature_text_dirs(variant_dir, label_filename):
+            if feature_dir in seen_dirs:
+                continue
+            entry = _entry_from_neuronpedia_feature_dir(feature_dir, label_filename)
+            if entry is not None:
+                out.setdefault(variant, []).append(entry)
+                seen_dirs.add(feature_dir)
     return out
 
 
@@ -225,20 +244,65 @@ def _entry_from_structured_results(
     return (model, source, int(feature), feature_dir)
 
 
+def _iter_feature_text_dirs(variant_dir: Path, label_filename: str):
+    """Yield candidate feature directories with imported explanation text."""
+    filenames = [label_filename, DEFAULT_DESCRIPTION_FILENAME, DEFAULT_LABEL_FILENAME]
+    seen = set()
+    for filename in filenames:
+        for text_path in variant_dir.rglob(filename):
+            feature_dir = text_path.parent
+            if feature_dir in seen:
+                continue
+            seen.add(feature_dir)
+            yield feature_dir
+
+
+def _entry_from_neuronpedia_feature_dir(
+    feature_dir: Path, label_filename: str,
+) -> Optional[DescriptionEntry]:
+    """Discover a baseline feature from Neuronpedia metadata."""
+    has_primary = (feature_dir / label_filename).exists()
+    has_description = (feature_dir / DEFAULT_DESCRIPTION_FILENAME).exists()
+    has_labels = (feature_dir / DEFAULT_LABEL_FILENAME).exists()
+    if not (has_primary or has_description or has_labels):
+        return None
+    metadata_path = feature_dir / "neuronpedia_feature.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except Exception:
+        return None
+    model = metadata.get("modelId")
+    source = metadata.get("layer")
+    source_obj = metadata.get("source")
+    if not source and isinstance(source_obj, dict):
+        source = source_obj.get("id")
+    feature = metadata.get("index")
+    if model is None or source is None or feature is None:
+        return None
+    try:
+        return (str(model), str(source), int(feature), feature_dir)
+    except (TypeError, ValueError):
+        return None
+
+
 def is_skipped_result(
     sr_path: Path,
     structured_results: Optional[Dict[str, object]] = None,
 ) -> bool:
     """Return True for generation outputs intentionally excluded from eval."""
     feature_dir = sr_path.parent
-    if (feature_dir / "skipped_log.json").exists():
-        return True
     sr = structured_results
     if sr is None:
         try:
             sr = json.loads(sr_path.read_text())
         except Exception:
             return False
+    if sr.get("final_state") == "Done" and has_completed_feature_text(feature_dir):
+        return False
+    if (feature_dir / "skipped_log.json").exists():
+        return True
     return (
         sr.get("status") == "skipped"
         or str(sr.get("failure_mode") or "").startswith("skipped_")
@@ -258,6 +322,7 @@ __all__ = [
     "discover_variant_features",
     "eval_text_source_to_filename",
     "filter_feature_groups_by_manifest",
+    "has_completed_feature_text",
     "is_skipped_result",
     "load_description",
     "load_feature_text",
